@@ -8,7 +8,6 @@ const int FORWARD_RIGHT_1 = 4;
 const int FORWARD_RIGHT_2 = 5;
 const int FORWARD_LEFT_1 = 7;
 const int FORWARD_LEFT_2 = 6;
-const int FORWARD_LEFT_2 = 6;
 const int POT = A2;
 
 // 조향 속도 상수
