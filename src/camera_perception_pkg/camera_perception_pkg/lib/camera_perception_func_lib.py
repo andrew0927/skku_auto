@@ -180,37 +180,38 @@ def get_lane_center(cv_image: np.array, detection_height: int, detection_thickne
 	return road_target_point_x
 
 
-def get_traffic_light_color(cv_image: np.array, bbox, hsv_ranges: dict) -> str:
-	x_min, x_max = int(bbox.center.position.x - bbox.size.x / 2), int(bbox.center.position.x + bbox.size.x / 2)
-	y_min, y_max = int(bbox.center.position.y - bbox.size.y / 2), int(bbox.center.position.y + bbox.size.y / 2)
+def get_traffic_light_color(cv_image: np.array, bbox, hsv_ranges: dict, min_ratio: float = 0.02) -> str:
+	height, width = cv_image.shape[:2]
+	x_min = max(0, int(bbox.center.position.x - bbox.size.x / 2))
+	x_max = min(width, int(bbox.center.position.x + bbox.size.x / 2))
+	y_min = max(0, int(bbox.center.position.y - bbox.size.y / 2))
+	y_max = min(height, int(bbox.center.position.y + bbox.size.y / 2))
 	roi = cv_image[y_min:y_max, x_min:x_max]
-	
+	if roi.size == 0:
+		return "Unknown"
+
 	hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
 	red_lower1, red_upper1 = hsv_ranges['red1']
 	red_lower2, red_upper2 = hsv_ranges['red2']
 	yellow_lower, yellow_upper = hsv_ranges['yellow']
 	green_lower, green_upper = hsv_ranges['green']
-	
-	red_mask1 = cv2.inRange(hsv_roi, red_lower1, red_upper1)
-	red_mask2 = cv2.inRange(hsv_roi, red_lower2, red_upper2)
-	red_mask = red_mask1 + red_mask2
+
+	red_mask = cv2.inRange(hsv_roi, red_lower1, red_upper1) | cv2.inRange(hsv_roi, red_lower2, red_upper2)
 	yellow_mask = cv2.inRange(hsv_roi, yellow_lower, yellow_upper)
 	green_mask = cv2.inRange(hsv_roi, green_lower, green_upper)
-	
-	red_ratio = cv2.countNonZero(red_mask) / (roi.size / 3)
-	yellow_ratio = cv2.countNonZero(yellow_mask) / (roi.size / 3)
-	green_ratio = cv2.countNonZero(green_mask) / (roi.size / 3)
-	
-	max_ratio = max(red_ratio, yellow_ratio, green_ratio)
-	if max_ratio == red_ratio:
-		return "Red"
-	elif max_ratio == yellow_ratio:
-		return "Yellow"
-	elif max_ratio == green_ratio:
-		return "Green"
-	else:
+
+	pixels = roi.shape[0] * roi.shape[1]
+	ratios = {
+		"Red": cv2.countNonZero(red_mask) / pixels,
+		"Yellow": cv2.countNonZero(yellow_mask) / pixels,
+		"Green": cv2.countNonZero(green_mask) / pixels,
+	}
+	color = max(ratios, key=ratios.get)
+	# 켜진 등의 색이 거의 없으면 판단하지 않음 (이전에는 이 경우 항상 Red였음)
+	if ratios[color] < min_ratio:
 		return "Unknown"
+	return color
 		
 		
 

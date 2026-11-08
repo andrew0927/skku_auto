@@ -27,7 +27,8 @@ class DriveCommand:
 
 
 class DriveModeController:
-    def __init__(self, mode='manual', manual_speed_limit=255, command_timeout=0.5):
+    def __init__(self, mode='manual', manual_speed_limit=255, command_timeout=0.5,
+                 auto_speed_limit=MAX_DRIVING_SPEED):
         if mode not in ('manual', 'autonomous'):
             raise ValueError('Choose manual or autonomous')
         self.mode = mode
@@ -36,6 +37,8 @@ class DriveModeController:
         self.auto = DriveCommand()
         self.last_auto_time = None
         self.manual_speed_limit = int(clamp(manual_speed_limit, 0, MAX_DRIVING_SPEED))
+        # w/s in autonomous mode; caps planner speeds and survives stops.
+        self.auto_speed_limit = int(clamp(auto_speed_limit, 0, MAX_DRIVING_SPEED))
         self.command_timeout = command_timeout
 
     @property
@@ -90,6 +93,10 @@ class DriveModeController:
             speed = clamp(speed, -self.manual_speed_limit, self.manual_speed_limit)
             self.manual = DriveCommand.bounded(steering, speed, speed)
             return 'manual_command'
+        if key in ('w', 's'):
+            step = 10 if key == 'w' else -10
+            self.auto_speed_limit = int(clamp(self.auto_speed_limit + step, 0, MAX_DRIVING_SPEED))
+            return 'speed_limit_changed'
         return 'ignored'
 
     def command(self, now):
@@ -97,7 +104,10 @@ class DriveModeController:
             return self.manual
         if (self.active and self.last_auto_time is not None
                 and 0 <= now - self.last_auto_time <= self.command_timeout):
-            return self.auto
+            limit = self.auto_speed_limit
+            return DriveCommand(self.auto.steering,
+                                int(clamp(self.auto.left_speed, -limit, limit)),
+                                int(clamp(self.auto.right_speed, -limit, limit)))
         return DriveCommand()
 
 

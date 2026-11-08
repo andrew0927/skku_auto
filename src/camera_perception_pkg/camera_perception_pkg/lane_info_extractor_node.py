@@ -48,12 +48,12 @@ class Yolov8InfoExtractor(Node):
         self.roi_pub.publish(image_msg)
         if self.show_image:
             edges = np.zeros((480, 640, 3), dtype=np.uint8)
-            for name, color in [('lane1', (255, 180, 0)), ('lane2', (0, 255, 0))]:
+            for row, (name, color) in enumerate([('lane1', (255, 180, 0)), ('lane2', (0, 255, 0)),
+                                                 ('crosswalk', (0, 0, 255))]):
                 if name in masks:
                     contours, _ = cv2.findContours(masks[name], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     cv2.drawContours(edges, contours, -1, color, 2)
-                cv2.putText(edges, name, (10, 25 if name == 'lane1' else 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.putText(edges, name, (10, 25 + 25 * row), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             preview = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
             if centers is not None:
                 for x, y in zip(centers, TARGET_HEIGHTS):

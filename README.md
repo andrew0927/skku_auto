@@ -13,11 +13,40 @@ ROS 모터 속도는 아두이노 PWM 범위에 맞춰 **-255~255**로 제한하
 ```bash
 cd ~/ros2_ws
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install
-./run_autonomous.sh cam_num:=4 port:=/dev/ttyACM0 cruise_speed:=255
+colcon build --symlink-install     # 처음 한 번, 코드 수정 후
+
+./run_autonomous.sh                # 차선 주행
+./run_traffic_light.sh             # 차선 주행 + 빨간불 정지
+
+./run_autonomous.sh 200            # 시작 속도 200 (0~255, 생략하면 255)
+./run_traffic_light.sh 180
 ```
 
-`cam_num`은 실제 카메라 장치 번호에 맞춥니다. 모델은 작업공간의 `best.pt`를
+신호등 버전은 빨간불을 보면 `red_approach_speed`(기본 150)로 감속해 차선을 계속
+따라가다가, 횡단보도 박스의 아래쪽 끝이 화면의 `crosswalk_stop_y`(기본 440, 화면 높이 480)
+선을 넘으면 정지합니다. 정지 후에는 초록불을 볼 때까지 기다리며, Space로 다시
+시작해도 출발합니다. 빨간불이 초록불로 바뀌면 `crossing_time`(기본 4초) 동안은 신호등이
+화면에서 사라지고 차선이 안 보여도 멈추지 않고 150 속도로 직진합니다. 그 사이 차선이
+보이면 바로 차선 추종으로 돌아가고, 4초가 지나면 평소처럼 차선이 없을 때 정지합니다.
+횡단보도가 가까이 보이는 동안에도 같은 직진을 합니다.
+정지 중 빨간불이 `red_release_time`(기본 3초) 동안 보고되지 않으면 초록을 못 알아봐도
+출발하며, 횡단보도 근처에서 빨간불이 다시 보이면 다시 멈춥니다(`red_release_time:=0`으로 끔).
+정지 중에는 신호등 영역의 픽셀을 정차 0.7초 후의 기준 영상과 비교해, 램프 크기의 뭉친
+영역이 확 밝아지면(빨간색 제외) 색을 못 읽어도 초록으로 판정합니다. 빨간 램프가 화면 밖이어도
+됩니다. 영역의 절반 이상이 한꺼번에 바뀌면(카메라 흔들림·노출 급변) 기준을 다시 잡습니다. 정지 중에는 정지 직전 신호등 위치의 램프 픽셀(빨강/초록)을 직접 읽어 YOLO가 신호등을 놓쳐도
+빨간불을 유지합니다. YOLO 점수 `light_min_score`(기본 0.5) 미만의 신호등 박스는
+무시합니다. 판정이 바뀔 때마다 신호등 조각이 `~/traffic_light_samples/`에 저장되므로,
+주행 후 이 사진으로 색 범위를 조정할 수 있습니다.
+횡단보도 박스가 덮는 높이의 차선 검출은 무시하고, 나머지 높이에서 보이는 차선을 직선으로
+연장해 경로를 만듭니다(`lane_roi` 창에서 횡단보도 영역이 회색으로 표시됨).
+차 바로 앞 차선이 안 보이면(매트 주름, 급커브) 먼 쪽 차선을 직선으로 연장해 감속 주행합니다. `traffic_light` 창에 신호등·횡단보도 박스와 정지선이 표시됩니다.
+더 일찍 멈추려면 값을 줄이고(`crosswalk_stop_y:=360`), 더 가까이 가서 멈추려면 늘립니다.
+
+자율주행 중 키보드 창에서 `w`/`s`를 누르면 최고속도가 ±10씩 바뀝니다.
+정지 후 다시 출발해도 바꾼 값이 유지됩니다.
+
+차량 카메라(C920)는 자동으로 찾습니다. 찾지 못하면 실행하지 않으며,
+`cam_num:=번호`로 직접 지정할 수 있습니다. 모델은 작업공간의 `best.pt`를
 사용하며 CUDA 사용이 가능하면 GPU, 아니면 CPU를 선택합니다. `device:=cuda:0`
 또는 `device:=cpu`로 명시할 수도 있습니다.
 
@@ -82,3 +111,15 @@ source install/local_setup.bash
 ROS_DOMAIN_ID=92 ROS_LOG_DIR=/tmp/ros2_ws_tests \
   PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q tests
 ```
+
+## 주행 기록과 차 없이 검증
+
+```bash
+./run_traffic_light.sh 150 record:=true      # 주행하며 영상·명령을 laps/lap_날짜시각/ 에 저장
+python3 tools/export_frames.py laps/lap_...  # 프레임 추출(초당 2장) + 6장 묶음 시트 + labels.csv
+# labels.csv 에 정답 작성: steering -7(왼쪽)~+7(오른쪽), go 1/0
+python3 tools/compare_labels.py laps/lap_... # 주행 당시 코드 action vs 정답
+./replay_lap.sh laps/lap_...                 # 수정한 코드로 같은 영상 재생 → 기록·정답과 비교
+```
+
+재생은 카메라·아두이노·키보드를 열지 않고 도메인 77에서 실행됩니다. 기록 1분당 약 0.6GB.

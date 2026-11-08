@@ -139,5 +139,147 @@ def test_red_light_has_priority_over_lane_loss(controller):
     node.light_callback(String(data='Green'))
     frame()
     node.light_callback(String(data='Red'))
+    node.crosswalk_callback(Bool(data=True))
     assert frame('lost').left_speed == 0
-    assert node.state == 'red traffic light'
+    assert node.state == 'stopped at crosswalk for red light'
+
+
+def test_red_light_slows_until_crosswalk_then_waits_for_green(controller):
+    node, clock, _, frame = controller
+    node.obey_lights = True
+    node.red_release_time = 0.0  # release on timeout disabled: only green starts the car
+    node.light_callback(String(data='Red'))
+    node.crosswalk_callback(Bool(data=False))
+    approach = frame()
+    assert 0 < approach.left_speed <= 150
+    assert node.state == 'lane following (red light ahead, approaching crosswalk)'
+    # The light may leave the frame while approaching; the red is remembered.
+    node.light_callback(String(data='None'))
+    assert frame().left_speed == approach.left_speed
+    node.crosswalk_callback(Bool(data=True))
+    assert frame().left_speed == 0
+    # Stays stopped even after the crosswalk/light leave the view, until green.
+    node.crosswalk_callback(Bool(data=False))
+    node.light_callback(String(data='None'))
+    assert frame(advance=5.0).left_speed == 0
+    node.light_callback(String(data='Green'))
+    assert frame().left_speed == 255
+
+
+def test_red_light_far_from_crosswalk_expires(controller):
+    node, clock, _, frame = controller
+    node.obey_lights = True
+    node.light_callback(String(data='Red'))
+    node.crosswalk_callback(Bool(data=False))
+    assert frame().left_speed == 150
+    clock.now += 3.5
+    node.light_callback(String(data='None'))
+    node.crosswalk_callback(Bool(data=False))
+    assert frame().left_speed == 255
+
+
+def test_space_restart_clears_red_stop(controller):
+    node, _, _, frame = controller
+    node.obey_lights = True
+    node.light_callback(String(data='Red'))
+    node.crosswalk_callback(Bool(data=True))
+    assert frame().left_speed == 0
+    node.reset_callback(Bool(data=True))
+    node.light_callback(String(data='None'))
+    assert frame().left_speed == 255
+
+
+def test_green_after_red_crosses_straight_while_lanes_are_missing(controller):
+    node, clock, _, frame = controller
+    node.obey_lights = True
+    node.light_callback(String(data='Red'))
+    node.crosswalk_callback(Bool(data=True))
+    assert frame().left_speed == 0
+    clock.now += 5.0
+    node.light_callback(String(data='Green'))
+    # The light leaves the view and the crosswalk box is gone while the lanes are still hidden.
+    node.light_callback(String(data='None'))
+    node.crosswalk_callback(Bool(data=False))
+    crossing = frame('lost')
+    assert crossing.left_speed == 150 and crossing.steering == 0
+    assert node.state == 'crossing crosswalk (lanes hidden, holding lane heading)'
+    # A partial lane detection without a usable path must not stop the car either.
+    assert frame('direct', malformed=True).left_speed == 150
+    # The detector keeps reporting 'no light' every frame while the car moves.
+    clock.now += 3.0
+    node.light_callback(String(data='None'))
+    assert frame('lost').left_speed == 150
+    # Lanes found again: normal lane following.
+    assert frame().left_speed == 255
+    # Window over (4 s after green): the usual lane-loss stop applies.
+    clock.now += 1.0
+    node.light_callback(String(data='None'))
+    assert frame('lost').left_speed == 0
+
+
+def test_green_without_red_does_not_open_crossing_window(controller):
+    node, _, _, frame = controller
+    node.obey_lights = True
+    node.light_callback(String(data='Green'))
+    node.crosswalk_callback(Bool(data=False))
+    frame()
+    assert frame('lost', advance=0.6).left_speed == 0
+
+
+def test_crosswalk_crossing_is_time_limited(controller):
+    node, clock, _, frame = controller
+    node.obey_lights = True
+    for _ in range(40):
+        node.light_callback(String(data='None'))
+        node.crosswalk_callback(Bool(data=True))
+        last = frame('lost', advance=0.15)
+    assert last.left_speed == 0
+
+
+def test_red_not_seen_releases_the_stop_and_red_again_stops(controller):
+    node, clock, _, frame = controller
+    node.obey_lights = True
+    node.red_release_time = 2.0
+    node.light_callback(String(data='Red'))
+    node.crosswalk_callback(Bool(data=True))
+    assert frame().left_speed == 0
+    # The colour check keeps missing green: only 'Unknown' arrives for 1.6 s.
+    for _ in range(5):
+        node.light_callback(String(data='Unknown'))
+        node.crosswalk_callback(Bool(data=True))
+        assert frame(advance=0.3).left_speed == 0
+    node.light_callback(String(data='Unknown'))
+    node.crosswalk_callback(Bool(data=True))
+    moving = frame('lost', advance=0.6)
+    assert moving.left_speed == 150 and node.state.startswith('crossing')
+    # Red reported again while the crosswalk is still near: stop again.
+    node.light_callback(String(data='Red'))
+    node.crosswalk_callback(Bool(data=True))
+    assert frame().left_speed == 0
+
+
+def test_red_approach_keeps_lane_heading_through_stop_and_green(controller):
+    node, clock, _, frame = controller
+    node.obey_lights = True
+    node.light_callback(String(data='Red'))
+    node.crosswalk_callback(Bool(data=False))
+    for _ in range(10):  # follow a left-curving lane while approaching
+        node.light_callback(String(data='Red'))
+        node.crosswalk_callback(Bool(data=False))
+        approach = frame(left=True)
+    held = approach.steering
+    assert held < 0
+    # Lanes vanish at the crosswalk: hold the lane heading, never the +4 right recovery.
+    node.light_callback(String(data='Red'))
+    node.crosswalk_callback(Bool(data=False))
+    lost = frame('lost')
+    assert lost.steering == held and 0 < lost.left_speed <= 150
+    node.light_callback(String(data='Red'))
+    node.crosswalk_callback(Bool(data=True))
+    stopped = frame('lost')
+    assert stopped.left_speed == 0 and stopped.steering == held
+    clock.now += 5.0
+    node.light_callback(String(data='Green'))
+    node.crosswalk_callback(Bool(data=True))
+    go = frame('lost')
+    assert go.left_speed == 150 and go.steering == held

@@ -77,3 +77,20 @@ def test_packets_fit_existing_arduino_buffer_in_both_directions():
 def test_out_of_range_260_never_reaches_arduino():
     assert DriveCommand.bounded(0, 260, 260) == DriveCommand(0, 255, 255)
     assert convert_serial_message(0, 260, 260) == 's0l255r255\n'
+
+
+def test_autonomous_w_s_adjust_speed_cap():
+    controller = DriveModeController('autonomous', auto_speed_limit=200)
+    controller.handle_key(' ')
+    controller.receive_auto(DriveCommand(3, 255, 255), 0)
+    assert controller.command(0.1) == DriveCommand(3, 200, 200)
+    for _ in range(5):
+        assert controller.handle_key('s') == 'speed_limit_changed'
+    assert controller.command(0.1) == DriveCommand(3, 150, 150)
+    controller.receive_auto(DriveCommand(3, 120, 120), 0.2)
+    assert controller.command(0.3) == DriveCommand(3, 120, 120)
+    controller.handle_key('x')
+    assert controller.auto_speed_limit == 150, 'Stopping keeps the chosen cap'
+    for _ in range(30):
+        controller.handle_key('w')
+    assert controller.auto_speed_limit == 255
