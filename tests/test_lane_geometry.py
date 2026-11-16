@@ -39,3 +39,45 @@ def test_fallback_uses_recent_measured_spacing_and_expires():
 def test_fallback_needs_an_observed_pair():
     result, source, _, _ = LaneCenterTracker().update([lane('lane1', 40, 180)], 'lane2', 0)
     assert result is None and source == 'lost'
+
+
+def test_lane1_uses_lane2_only_with_a_recent_measured_pair():
+    tracker = LaneCenterTracker(pair_timeout=2.0)
+    one, two = lane('lane1', 40, 180), lane('lane2', 220, 360)
+    direct, source, _, _ = tracker.update([one, two], 'lane1', 0)
+    assert source == 'direct'
+    result, source, _, _ = tracker.update([two], 'lane1', 0.2)
+    assert source == 'estimated'
+    assert result == pytest.approx(direct, abs=2)
+    assert tracker.update([two], 'lane1', 2.1)[1] == 'lost'
+    assert LaneCenterTracker().update([two], 'lane1', 0)[1] == 'lost'
+
+
+def test_clipped_lane_uses_lane_width_instead_of_visible_midpoint():
+    roi = np.zeros((180, 640), dtype=np.uint8)
+    roi[:, :200] = 255
+    assert region_centers(roi) == [49.0] * 3
+    roi[:] = 0
+    roi[:, 440:] = 255
+    assert region_centers(roi) == [590.0] * 3
+
+
+def test_target_jumps_are_limited_then_rejected_without_poisoning_history():
+    tracker = LaneCenterTracker()
+    original = tracker.update([lane('lane2', 100, 240)], 'lane2', 0)[0]
+    limited, source, _, _ = tracker.update([lane('lane2', 180, 320)], 'lane2', 0.1)
+    assert source == 'estimated'
+    assert max(b - a for a, b in zip(original, limited)) <= 55.1
+    assert tracker.update([lane('lane2', 400, 540)], 'lane2', 0.2)[1] == 'lost'
+    assert tracker.update([lane('lane2', 180, 320)], 'lane2', 0.3)[1] == 'direct'
+
+
+def test_lane_change_keeps_spacing_but_clears_old_lane_center_history():
+    tracker = LaneCenterTracker()
+    one, two = lane('lane1', 40, 180), lane('lane2', 220, 360)
+    expected = LaneCenterTracker().update([one, two], 'lane1', 0)[0]
+    tracker.update([one, two], 'lane2', 0)
+    tracker.reset(keep_pairs=True)
+    result, source, _, _ = tracker.update([two], 'lane1', 0.1)
+    assert source == 'estimated'
+    assert result == pytest.approx(expected, abs=2)

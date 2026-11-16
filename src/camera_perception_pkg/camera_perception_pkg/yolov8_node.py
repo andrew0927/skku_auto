@@ -15,6 +15,8 @@
 
 
 from typing import List, Dict
+import json
+import time
 import numpy as np
 
 import rclpy
@@ -45,6 +47,8 @@ from interfaces_pkg.msg import Detection
 from interfaces_pkg.msg import DetectionArray
 
 from std_srvs.srv import SetBool
+from std_msgs.msg import String
+from .lane_inference import GreenLaneInference, merge_detection_groups
 
 
 class Yolov8Node(LifecycleNode):
@@ -64,10 +68,19 @@ class Yolov8Node(LifecycleNode):
         
         self.declare_parameter("threshold", 0.5)
         self.declare_parameter("enable", True)
+        self.declare_parameter('enable_green_grayscale_fallback', True)
+        self.target_lane = self.declare_parameter('target_lane', 'lane2').value
+        self.declare_parameter('green_context_hold', 1.0)
+        self.declare_parameter('green_color_probe_interval', 0.4)
+        self.declare_parameter('green_color_confirmations', 3)
+        self.inference = None
+        self.signal_color = None
+        self.last_signal_time = None
         self.declare_parameter("image_reliability",
                                QoSReliabilityPolicy.RELIABLE)
 
         self.get_logger().info('Yolov8Node created')
+        self.last_inference_mode = None
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f'Configuring {self.get_name()}')
@@ -98,17 +111,34 @@ class Yolov8Node(LifecycleNode):
 
         self._pub = self.create_lifecycle_publisher(
             DetectionArray, "detections", 1)
+        self.debug_pub = self.create_publisher(String, 'yolo_inference_debug', 1)
         self._srv = self.create_service(
             SetBool, "enable", self.enable_cb
         )
         self.cv_bridge = CvBridge()
+        self.target_sub = self.create_subscription(
+            String, 'target_lane', self.target_callback,
+            QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL))
+        self.signal_sub = self.create_subscription(
+            String, 'yolov8_traffic_light_info', self.signal_callback, 1)
 
         return TransitionCallbackReturn.SUCCESS
 
     def enable_cb(self, request, response):
         self.enable = request.data
+        if self.inference is not None:
+            self.inference.reset()
         response.success = True
         return response
+
+    def target_callback(self, msg):
+        if msg.data in ('lane1', 'lane2'):
+            self.target_lane = msg.data
+            if self.inference is not None:
+                self.inference.set_target_lane(msg.data)
+
+    def signal_callback(self, msg):
+        self.signal_color, self.last_signal_time = msg.data, time.monotonic()
 
     def on_activate(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f'Activating {self.get_name()}')
@@ -121,6 +151,13 @@ class Yolov8Node(LifecycleNode):
                 raise ValueError(f'Model has no lane2 class: {self.yolo.names}')
             self.yolo.predict(np.zeros((480, 640, 3), dtype=np.uint8),
                               device=self.device, verbose=False)
+            self.inference = GreenLaneInference(
+                self.yolo, self.threshold, self.device,
+                self.get_parameter('enable_green_grayscale_fallback').value,
+                target_lane=self.target_lane,
+                green_hold=self.get_parameter('green_context_hold').value,
+                probe_interval=self.get_parameter('green_color_probe_interval').value,
+                color_confirmations=self.get_parameter('green_color_confirmations').value)
         except FileNotFoundError:
             self.get_logger().error(f"Error: Model file '{self.model}' not found!")
             return TransitionCallbackReturn.FAILURE
@@ -145,6 +182,7 @@ class Yolov8Node(LifecycleNode):
     def on_deactivate(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f'Deactivating {self.get_name()}')
 
+        self.inference = None
         del self.yolo
         if 'cuda' in self.device:
             self.get_logger().info("Clearing CUDA cache")
@@ -161,6 +199,8 @@ class Yolov8Node(LifecycleNode):
         self.get_logger().info(f'Cleaning up {self.get_name()}')
 
         self.destroy_publisher(self._pub)
+        self.destroy_subscription(self.target_sub)
+        self.destroy_subscription(self.signal_sub)
 
         del self.image_qos_profile
 
@@ -254,69 +294,53 @@ class Yolov8Node(LifecycleNode):
 
         return keypoints_list
 
-    def image_cb(self, msg: Image) -> None:
-        if self.enable:
+    def detections_from_result(self, results):
+        hypothesis = self.parse_hypothesis(results) if results.boxes else []
+        boxes = self.parse_boxes(results) if results.boxes else []
+        masks = self.parse_masks(results) if results.masks else []
+        keypoints = self.parse_keypoints(results) if results.keypoints else []
+        detections = []
+        for i in range(len(results)):
+            detection = Detection()
+            if results.boxes:
+                detection.class_id = hypothesis[i]['class_id']
+                detection.class_name = hypothesis[i]['class_name']
+                detection.score = hypothesis[i]['score']
+                detection.bbox = boxes[i]
+            if results.masks:
+                detection.mask = masks[i]
+            if results.keypoints:
+                detection.keypoints = keypoints[i]
+            detections.append(detection)
+        return detections
 
-            # convert image + predict
+    def image_cb(self, msg: Image) -> None:
+        output = DetectionArray()
+        output.header = msg.header
+        if self.enable:
+            started = time.monotonic()
             try:
-                cv_image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-                results = self.yolo.predict(
-                    source=cv_image,
-                    verbose=False,
-                    stream=False,
-                    conf=self.threshold,
-                    device=self.device
-                )
+                image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+                hint = (self.signal_color if self.last_signal_time is not None
+                        and 0 <= started - self.last_signal_time <= 1.0 else None)
+                groups, debug = self.inference.predict(
+                    image, now=started, signal_color=hint,
+                    frame_stamp=msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9)
+                output.detections = merge_detection_groups(
+                    [self.detections_from_result(result) for result in groups],
+                    prefer_recovered_lanes=debug['prefer_recovered_lanes'])
+                debug.update(stamp=msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9,
+                             inference_ms=round((time.monotonic() - started) * 1000, 1))
+                self.debug_pub.publish(String(data=json.dumps(debug)))
+                if debug['mode'] != self.last_inference_mode:
+                    self.get_logger().info(f"Lane inference mode: {debug['mode']}")
+                    self.last_inference_mode = debug['mode']
             except Exception as error:
                 self.get_logger().error(f'Image inference failed: {error}')
-                empty = DetectionArray()
-                empty.header = msg.header
-                self._pub.publish(empty)
-                return
-            results: Results = results[0].cpu()
-
-            if results.boxes:
-                hypothesis = self.parse_hypothesis(results)
-                boxes = self.parse_boxes(results)
-
-            if results.masks:
-                masks = self.parse_masks(results)
-
-            if results.keypoints:
-                keypoints = self.parse_keypoints(results)
-
-            # create detection msgs
-            detections_msg = DetectionArray()
-
-            for i in range(len(results)):
-
-                aux_msg = Detection()
-
-                if results.boxes:
-                    aux_msg.class_id = hypothesis[i]["class_id"]
-                    aux_msg.class_name = hypothesis[i]["class_name"]
-                    aux_msg.score = hypothesis[i]["score"]
-
-                    aux_msg.bbox = boxes[i]
-
-                if results.masks:
-                    aux_msg.mask = masks[i]
-
-                if results.keypoints:
-                    aux_msg.keypoints = keypoints[i]
-
-                detections_msg.detections.append(aux_msg)
-
-            # publish detections
-            detections_msg.header = msg.header
-            self._pub.publish(detections_msg)
-
-            del results
-            del cv_image
+                self.inference.reset()
         else:
-            empty = DetectionArray()
-            empty.header = msg.header
-            self._pub.publish(empty)
+            self.inference.reset()
+        self._pub.publish(output)
 
 
 def main():

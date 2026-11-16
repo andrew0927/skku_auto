@@ -181,8 +181,16 @@ def get_lane_center(cv_image: np.array, detection_height: int, detection_thickne
 
 
 def get_traffic_light_color(cv_image: np.array, bbox, hsv_ranges: dict) -> str:
-	x_min, x_max = int(bbox.center.position.x - bbox.size.x / 2), int(bbox.center.position.x + bbox.size.x / 2)
-	y_min, y_max = int(bbox.center.position.y - bbox.size.y / 2), int(bbox.center.position.y + bbox.size.y / 2)
+	values = (bbox.center.position.x, bbox.center.position.y, bbox.size.x, bbox.size.y)
+	if not np.isfinite(values).all() or bbox.size.x <= 0 or bbox.size.y <= 0:
+		return "Unknown"
+	height, width = cv_image.shape[:2]
+	x_min = max(0, int(bbox.center.position.x - bbox.size.x / 2))
+	x_max = min(width, int(bbox.center.position.x + bbox.size.x / 2))
+	y_min = max(0, int(bbox.center.position.y - bbox.size.y / 2))
+	y_max = min(height, int(bbox.center.position.y + bbox.size.y / 2))
+	if x_min >= x_max or y_min >= y_max:
+		return "Unknown"
 	roi = cv_image[y_min:y_max, x_min:x_max]
 	
 	hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -203,7 +211,9 @@ def get_traffic_light_color(cv_image: np.array, bbox, hsv_ranges: dict) -> str:
 	green_ratio = cv2.countNonZero(green_mask) / (roi.size / 3)
 	
 	max_ratio = max(red_ratio, yellow_ratio, green_ratio)
-	if max_ratio == red_ratio:
+	if max_ratio == 0:
+		return "Unknown"
+	elif max_ratio == red_ratio:
 		return "Red"
 	elif max_ratio == yellow_ratio:
 		return "Yellow"

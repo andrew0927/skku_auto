@@ -6,6 +6,7 @@ import time
 
 import cv2
 import numpy as np
+import pytest
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
@@ -19,7 +20,8 @@ from decision_making_pkg.teleop_keyboard_node import TeleopKeyboardNode
 from serial_communication_pkg.serial_sender_node import SerialSenderNode
 
 
-def test_keyboard_path_and_serial_timeout_without_hardware():
+@pytest.mark.parametrize('target_lane', ['lane1', 'lane2'])
+def test_keyboard_path_and_serial_timeout_without_hardware(target_lane):
     master, slave = os.openpty()
     virtual_port = os.ttyname(slave)
     assert virtual_port.startswith('/dev/pts/')
@@ -31,9 +33,15 @@ def test_keyboard_path_and_serial_timeout_without_hardware():
     try:
         detector = Node('synthetic_lane_detector')
         pub = detector.create_publisher(DetectionArray, 'detections', 1)
-        extractor = Yolov8InfoExtractor(parameter_overrides=[Parameter('show_image', value=False)])
+        extractor = Yolov8InfoExtractor(parameter_overrides=[
+            Parameter('show_image', value=False), Parameter('target_lane', value=target_lane)])
         planner = PathPlannerNode()
-        motion = MotionPlanningNode()
+        motion = MotionPlanningNode(parameter_overrides=[
+            Parameter('obey_traffic_lights', value=False),
+            Parameter('enable_obstacle_avoidance', value=False),
+            Parameter('lane_loss_hold', value=0.4),
+            Parameter('target_lane', value=target_lane),
+        ])
         keyboard = TeleopKeyboardNode(mode='autonomous')
         sender = SerialSenderNode(parameter_overrides=[
             Parameter('port', value=virtual_port), Parameter('startup_delay', value=0.0),
@@ -47,7 +55,7 @@ def test_keyboard_path_and_serial_timeout_without_hardware():
         polygon = cv2.perspectiveTransform(
             np.float32([[[250, 0], [390, 0], [390, 479], [250, 479]]]),
             cv2.getPerspectiveTransform(dst, src))[0]
-        detection = Detection(class_name='lane2', score=0.99)
+        detection = Detection(class_name=target_lane, score=0.99)
         detection.mask.width, detection.mask.height = 640, 480
         detection.mask.data = [Point2D(x=float(x), y=float(y)) for x, y in polygon]
         packet_buffer = b''
@@ -93,7 +101,9 @@ def test_keyboard_path_and_serial_timeout_without_hardware():
         assert packets[-1] == (0, 0, 0)
         run(0.4)
         assert packets[-1][1] > 0
-        run(0.9, publish=False)
+        run(0.75, publish=False)
+        assert packets[-1][1:] == (70, 70), 'Brief path gaps must use low speed, not a zero packet'
+        run(0.4, publish=False)
         assert packets[-1] == (0, 0, 0)
         keyboard.process_key('1')
         keyboard.process_key('w')

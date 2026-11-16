@@ -1,7 +1,11 @@
 /build/
+/build_before_*/
 /install/
+/install_before_*/
 /log/
 __pycache__/
+*.py[cod]
 .pytest_cache/
 *.egg-info/
 .DS_Store
+.vscode/

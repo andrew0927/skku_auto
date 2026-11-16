@@ -16,6 +16,12 @@ class ImagePublisherNode(Node):
         self.img_dir = self.declare_parameter('img_dir', '').value
         self.video_path = self.declare_parameter('video_path', '').value
         self.show_image = self.declare_parameter('logger', True).value
+        self.stop_y_ratio = self.declare_parameter('crosswalk_stop_y_ratio', 325.0 / 480.0).value
+        self.stop_edge = self.declare_parameter('crosswalk_stop_edge', 'far_edge').value
+        if self.stop_edge not in ('near_edge', 'far_edge'):
+            raise ValueError('crosswalk_stop_edge must be near_edge or far_edge')
+        if not 0.2 <= self.stop_y_ratio <= 0.95:
+            raise ValueError('crosswalk_stop_y_ratio must be between 0.2 and 0.95')
         period = self.declare_parameter('timer', 0.1).value
         if period <= 0:
             raise ValueError('timer must be positive')
@@ -63,7 +69,12 @@ class ImagePublisherNode(Node):
         msg.header.frame_id = 'camera'
         self.publisher.publish(msg)
         if self.show_image:
-            cv2.imshow('Camera Image', frame)
+            preview = frame.copy()
+            line_y = round(preview.shape[0] * self.stop_y_ratio)
+            cv2.line(preview, (0, line_y), (preview.shape[1] - 1, line_y), (0, 0, 255), 2)
+            cv2.putText(preview, f'Crosswalk {self.stop_edge} stop y={line_y}', (10, line_y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            cv2.imshow('Camera Image', preview)
             cv2.waitKey(1)
 
     def close(self):

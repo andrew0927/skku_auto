@@ -1,6 +1,7 @@
-"""Track lane2, with lane1 fallback only while the measured lane spacing is fresh."""
+"""Track either lane, estimating missing targets from recent measured spacing."""
 
 import time
+import json
 import cv2
 import numpy as np
 import rclpy
@@ -20,28 +21,37 @@ class Yolov8InfoExtractor(Node):
         pair_timeout = self.declare_parameter('pair_timeout', 2.0).value
         if self.target_lane not in ('lane1', 'lane2'):
             raise ValueError('target_lane must be lane1 or lane2')
-        self.tracker = LaneCenterTracker(pair_timeout)
+        self.tracker = LaneCenterTracker(
+            pair_timeout,
+            self.declare_parameter('lane_width', 300.0).value,
+            self.declare_parameter('max_center_step', 110.0).value,
+            self.declare_parameter('max_accepted_step', 55.0).value)
         self.cv_bridge = CvBridge()
         self.subscriber = self.create_subscription(DetectionArray, 'detections', self.detection_callback, 1)
         self.publisher = self.create_publisher(LaneInfo, 'yolov8_lane_info', 1)
         self.source_pub = self.create_publisher(String, 'lane_tracking_source', 1)
+        self.debug_pub = self.create_publisher(String, 'lane_tracking_debug', 1)
         self.roi_pub = self.create_publisher(Image, 'roi_image', 1)
         self.reset_sub = self.create_subscription(String, 'target_lane', self.target_callback, 1)
 
     def target_callback(self, msg):
         if msg.data in ('lane1', 'lane2') and msg.data != self.target_lane:
             self.target_lane = msg.data
-            self.tracker.reset()
+            self.tracker.reset(keep_pairs=True)
 
     def detection_callback(self, msg):
         centers, source, masks, roi = self.tracker.update(msg.detections, self.target_lane, time.monotonic())
         lane = LaneInfo()
         lane.header = msg.header
         lane.tracking_source = source
+        lane.target_lane = self.target_lane
         if centers is not None:
             for x, y in zip(centers, TARGET_HEIGHTS):
                 lane.target_points.append(TargetPoint(target_x=round(x), target_y=y))
         self.source_pub.publish(String(data=source))
+        self.debug_pub.publish(String(data=json.dumps(dict(
+            stamp=msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9,
+            tracking_source=source, **self.tracker.debug))))
         self.publisher.publish(lane)
         image_msg = self.cv_bridge.cv2_to_imgmsg(roi, encoding='mono8')
         image_msg.header = msg.header

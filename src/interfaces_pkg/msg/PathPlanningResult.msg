@@ -1,6 +1,7 @@
 # PathPlanningResult.msg
 std_msgs/Header header
 string tracking_source
+string target_lane
 
 # 경로의 각 점들의 x 좌표
 float64[] x_points

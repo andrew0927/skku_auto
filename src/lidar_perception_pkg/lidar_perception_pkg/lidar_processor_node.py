@@ -1,60 +1,54 @@
+"""Normalize the mounted lidar into 360 angular bins, preserving scan time."""
+
+import math
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 
-from rclpy.qos import QoSProfile
-from rclpy.qos import QoSHistoryPolicy
-from rclpy.qos import QoSDurabilityPolicy
-from rclpy.qos import QoSReliabilityPolicy
-
-from .lib import lidar_perception_func_lib as LPFL
-
-#---------------Variable Setting---------------
-# Subscribe할 토픽 이름
-SUB_TOPIC_NAME = 'lidar_raw'
-
-# Publish할 토픽 이름
-PUB_TOPIC_NAME = 'lidar_processed'
-#----------------------------------------------
 
 class LidarSensorDataProcessor(Node):
-    def __init__(self):
-        super().__init__('lidar_processor_node')
-
-        self.qos_profile = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            durability=QoSDurabilityPolicy.VOLATILE,
-            depth=1
-        )
-
-        self.subscription = self.create_subscription(
-            LaserScan,
-            SUB_TOPIC_NAME,
-            self.lidar_raw_cb,
-            self.qos_profile)  
-        
-        self.publisher = self.create_publisher(
-            LaserScan,
-            PUB_TOPIC_NAME,
-            self.qos_profile) 
+    def __init__(self, **kwargs):
+        super().__init__('lidar_processor_node', **kwargs)
+        self.offset = self.declare_parameter('offset', 0.0).value
+        self.flip = self.declare_parameter('flip', True).value
+        self.subscription = self.create_subscription(LaserScan, 'lidar_raw', self.lidar_raw_cb, 1)
+        self.publisher = self.create_publisher(LaserScan, 'lidar_processed', 1)
 
     def lidar_raw_cb(self, msg):
-        # 이 함수는 Lidar 데이터를 수신할 때마다 호출 됨.
-        ranges = msg.ranges
-        intensities = msg.intensities
+        if not msg.ranges or not math.isfinite(msg.angle_increment) or msg.angle_increment == 0:
+            return
+        result = LaserScan()
+        result.header = msg.header
+        result.angle_min = 0.0
+        result.angle_max = math.radians(359)
+        result.angle_increment = math.radians(1)
+        result.scan_time = msg.scan_time
+        result.range_min, result.range_max = msg.range_min, msg.range_max
+        ranges, intensities = [math.inf] * 360, [0.0] * 360
+        for index, distance in enumerate(msg.ranges):
+            if not math.isfinite(distance) or not msg.range_min <= distance <= msg.range_max:
+                continue
+            angle = math.degrees(msg.angle_min + index * msg.angle_increment) - self.offset
+            bin_index = round(-angle if self.flip else angle) % 360
+            if distance < ranges[bin_index]:
+                ranges[bin_index] = distance
+                if index < len(msg.intensities):
+                    intensities[bin_index] = msg.intensities[index]
+        result.ranges, result.intensities = ranges, intensities
+        self.publisher.publish(result)
 
-        msg = LPFL.rotate_lidar_data(msg, offset = 0) # offset은 0부터 359까지의 값을 입력
-        msg = LPFL.flip_lidar_data(msg, pivot_angle = 0) # pivot_angle은 0부터 359까지의 값을 입력
-        self.publisher.publish(msg)
-        self.get_logger().info(f'Received scan with {len(ranges)} ranges and {len(intensities)} intensities')
 
 def main(args=None):
     rclpy.init(args=args)
-    lidar_processor = LidarSensorDataProcessor()
-    rclpy.spin(lidar_processor)
-    lidar_processor.destroy_node()
-    rclpy.shutdown()
+    node = LidarSensorDataProcessor()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
 
 if __name__ == '__main__':
     main()

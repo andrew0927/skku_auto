@@ -28,7 +28,7 @@ def test_space_cannot_use_missing_stale_or_future_command(command_time):
     assert controller.command(10.0) == DriveCommand()
 
 
-@pytest.mark.parametrize('key', ['1', '2', 'x', 'q', '\x03'])
+@pytest.mark.parametrize('key', ['1', '2', '3', 'x', 'q', '\x03'])
 def test_mode_switch_or_stop_discards_previous_motion(key):
     controller = DriveModeController('autonomous')
     controller.handle_key(' ')
@@ -77,3 +77,19 @@ def test_packets_fit_existing_arduino_buffer_in_both_directions():
 def test_out_of_range_260_never_reaches_arduino():
     assert DriveCommand.bounded(0, 260, 260) == DriveCommand(0, 255, 255)
     assert convert_serial_message(0, 260, 260) == 's0l255r255\n'
+
+
+def test_parking_and_lane_commands_cannot_leak_between_modes():
+    controller = DriveModeController('autonomous')
+    controller.receive_auto(DriveCommand(1, 255, 255), 1.0)
+    controller.handle_key('3')
+    assert controller.state == 'parking_waiting'
+    assert controller.command(1.1) == DriveCommand()
+    controller.receive_parking(DriveCommand(7, -150, -150), 1.1)
+    assert controller.command(1.2) == DriveCommand()
+    assert controller.handle_key(' ') == 'parking_started'
+    assert controller.command(1.2) == DriveCommand(7, -150, -150)
+    assert controller.command(2.0) == DriveCommand()
+    controller.handle_key('2')
+    controller.handle_key(' ')
+    assert controller.command(2.1) == DriveCommand()

@@ -346,9 +346,14 @@ class RPLidar(object):
     def _read_response(self, dsize):
         '''Reads response packet with length of `dsize` bytes'''
         self.logger.debug('Trying to read response: %d bytes', dsize)
+        deadline = time.monotonic() + self.timeout
         while self._serial.inWaiting() < dsize:
+            if time.monotonic() >= deadline:
+                raise RPLidarException('Timed out waiting for sensor response')
             time.sleep(0.001)
         data = self._serial.read(dsize)
+        if len(data) != dsize:
+            raise RPLidarException('Response length mismatch')
         self.logger.debug('Received data: %s', _showhex(data))
         return data
 
@@ -361,8 +366,7 @@ class RPLidar(object):
             Dictionary with the sensor information
         '''
         if self._serial.inWaiting() > 0:
-            return ('Data in buffer, you can\'t have info ! '
-                    'Run clean_input() to emptied the buffer.')
+            raise RPLidarException('Input buffer is not empty before get_info')
         self._send_cmd(GET_INFO_BYTE)
         dsize, is_single, dtype = self._read_descriptor()
         if dsize != INFO_LEN:
@@ -398,8 +402,7 @@ class RPLidar(object):
             The related error code that caused a warning/error.
         '''
         if self._serial.inWaiting() > 0:
-            return ('Data in buffer, you can\'t have info ! '
-                    'Run clean_input() to emptied the buffer.')
+            raise RPLidarException('Input buffer is not empty before get_health')
         self.logger.info('Asking for health')
         self._send_cmd(GET_HEALTH_BYTE)
         dsize, is_single, dtype = self._read_descriptor()
@@ -440,6 +443,8 @@ class RPLidar(object):
         '''
         if self.scanning[0]:
             return 'Scanning already running !'
+        # A previous session or the USB boot message can leave unread bytes.
+        self.stop()
         '''Start the scanning process, enable laser diode and the
         measurement system'''
         status, error_code = self.get_health()

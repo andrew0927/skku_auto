@@ -18,6 +18,7 @@ class PathPlannerNode(Node):
         result = PathPlanningResult()
         result.header = msg.header
         result.tracking_source = msg.tracking_source
+        result.target_lane = msg.target_lane
         points = [(float(p.target_y), float(p.target_x)) for p in msg.target_points]
         if len(points) >= 2 and all(np.isfinite(v) for point in points for v in point):
             # The vehicle anchor takes precedence if a detection shares its y coordinate.

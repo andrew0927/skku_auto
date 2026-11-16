@@ -23,6 +23,7 @@ setup(
             'motion_planner_node = decision_making_pkg.motion_planner_node:main',
             'path_planner_node = decision_making_pkg.path_planner_node:main',
             'teleop_keyboard_node = decision_making_pkg.teleop_keyboard_node:main',
+            'parking_node = decision_making_pkg.parking_node:main',
         ],
     },
 )

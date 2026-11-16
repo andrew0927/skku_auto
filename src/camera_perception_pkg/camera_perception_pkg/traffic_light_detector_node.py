@@ -1,90 +1,98 @@
-import cv2
-import random
-import numpy as np
-from typing import Tuple
-import sys, os
+"""YOLO signal colors with a geometric fallback for missed horizontal lamps."""
+
+import json
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
-from rclpy.qos import QoSHistoryPolicy
-from rclpy.qos import QoSDurabilityPolicy
-from rclpy.qos import QoSReliabilityPolicy
-
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from cv_bridge import CvBridge
-
 from sensor_msgs.msg import Image
-from interfaces_pkg.msg import DetectionArray, BoundingBox2D, Detection
-from std_msgs.msg import String
+from interfaces_pkg.msg import DetectionArray
+from std_msgs.msg import Bool, String
 
 from .lib import camera_perception_func_lib as CPFL
+from .signal_geometry import HSV_RANGES, ColorConfirmation, find_signal_lamp
 
-# ---------------Variable Setting---------------
-# Subscribe할 토픽 이름
-SUB_DETECTION_TOPIC_NAME = "detections"
-SUB_IMAGE_TOPIC_NAME = "image_raw"
-
-# Publish할 토픽 이름
-PUB_TOPIC_NAME = "yolov8_traffic_light_info"
-
-# ----------------------------------------------
 
 class TrafficLightDetector(Node):
-    def __init__(self):
-        super().__init__('traffic_light_detector_node')
-
-        self.sub_detection_topic = self.declare_parameter('sub_detection_topic', SUB_DETECTION_TOPIC_NAME).value
-        self.sub_image_topic = self.declare_parameter('sub_image_topic', SUB_IMAGE_TOPIC_NAME).value
-        self.pub_topic = self.declare_parameter('pub_topic', PUB_TOPIC_NAME).value
-
+    def __init__(self, **kwargs):
+        super().__init__('traffic_light_detector_node', **kwargs)
+        detection_topic = self.declare_parameter('sub_detection_topic', 'detections').value
+        image_topic = self.declare_parameter('sub_image_topic', 'image_raw').value
+        output_topic = self.declare_parameter('pub_topic', 'yolov8_traffic_light_info').value
+        self.max_height_ratio = self.declare_parameter('max_height_ratio', 0.45).value
+        self.fallback_enabled = self.declare_parameter('enable_lamp_fallback', True).value
+        self.source_timeout = self.declare_parameter('source_timeout', 1.0).value
+        self.confirmation = ColorConfirmation(
+            self.declare_parameter('confirmation_frames', 2).value,
+            self.declare_parameter('green_confirmation_frames', 3).value)
+        if not 0.1 <= self.max_height_ratio <= 0.6 or self.source_timeout <= 0:
+            raise ValueError('Invalid traffic light region or timeout')
         self.cv_bridge = CvBridge()
-
-        self.qos_profile = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            durability=QoSDurabilityPolicy.VOLATILE,
-            depth=1
-        )
-
-        self.detection_sub = Subscriber(self, DetectionArray, self.sub_detection_topic, qos_profile=self.qos_profile)
-        self.image_sub = Subscriber(self, Image, self.sub_image_topic, qos_profile=self.qos_profile)
+        self.detection_sub = Subscriber(self, DetectionArray, detection_topic, qos_profile=1)
+        self.image_sub = Subscriber(self, Image, image_topic, qos_profile=1)
         self.ts = ApproximateTimeSynchronizer([self.detection_sub, self.image_sub], queue_size=10, slop=0.1)
         self.ts.registerCallback(self.sync_callback)
+        self.publisher = self.create_publisher(String, output_topic, 1)
+        self.presence_pub = self.create_publisher(Bool, 'traffic_light_presence', 1)
+        self.debug_pub = self.create_publisher(String, 'traffic_light_debug', 1)
+        self.preview_pub = self.create_publisher(Image, 'traffic_light_preview', 1)
+        self.last_stamp = 0.0
+        self.last_display = None
 
-        self.publisher = self.create_publisher(String, self.pub_topic, self.qos_profile)
-
-    def sync_callback(self, detection_msg: DetectionArray, image_msg: Image):
-        cv_image = self.cv_bridge.imgmsg_to_cv2(image_msg, desired_encoding='bgr8')
-        
-        traffic_light_detected = False
+    def sync_callback(self, detection_msg, image_msg):
+        stamps = [m.header.stamp.sec + m.header.stamp.nanosec / 1e9
+                  for m in (detection_msg, image_msg)]
+        stamp = min(stamps)
+        now = self.get_clock().now().nanoseconds / 1e9
+        if stamp <= self.last_stamp or not -0.05 <= now - stamp <= self.source_timeout:
+            return
+        self.last_stamp = stamp
+        image = self.cv_bridge.imgmsg_to_cv2(image_msg, desired_encoding='bgr8')
+        candidates, model_count = [], 0
         for detection in detection_msg.detections:
-            if detection.class_name.casefold().replace('_', '') == 'trafficlight':
-
-                hsv_ranges = {
-                    'red1': (np.array([0, 100, 95]), np.array([10, 255, 255])),
-                    'red2': (np.array([160, 100, 95]), np.array([179, 255, 255])),
-                    'yellow': (np.array([20, 100, 95]), np.array([30, 255, 255])),
-                    'green': (np.array([40, 100, 95]), np.array([90, 255, 255]))
-                }
-
-                # get_traffic_light_color -> Red, Yellow, Green, Unknown
-                traffic_light_color = CPFL.get_traffic_light_color(cv_image, detection.bbox, hsv_ranges) 
-                
-                # Publish traffic light color as string
-                color_msg = String()
-                color_msg.data = traffic_light_color
-                self.get_logger().debug(f'traffic light: {color_msg.data}')
-                self.publisher.publish(color_msg)
-                traffic_light_detected = True
-                break  # Only process the first detected traffic light
-
-        if not traffic_light_detected:
-            # Publish 'None' if no traffic light is detected
-            color_msg = String()
-            color_msg.data = 'None'
-            self.get_logger().debug(f'traffic light: {color_msg.data}')
-            self.publisher.publish(color_msg)
+            if detection.class_name.casefold().replace('_', '') != 'trafficlight':
+                continue
+            model_count += 1
+            box = detection.bbox
+            if box.center.position.y > image.shape[0] * self.max_height_ratio:
+                continue
+            color = CPFL.get_traffic_light_color(image, box, HSV_RANGES)
+            candidates.append(dict(color=color, source='yolo', score=detection.score,
+                                   box=[box.center.position.x - box.size.x / 2,
+                                        box.center.position.y - box.size.y / 2,
+                                        box.center.position.x + box.size.x / 2,
+                                        box.center.position.y + box.size.y / 2]))
+        if self.fallback_enabled:
+            fallback = find_signal_lamp(image, self.max_height_ratio)
+            if fallback is not None:
+                candidates.append(fallback)
+        priority = {'Red': 3, 'Yellow': 2, 'Green': 1, 'Unknown': 0}
+        selected = max(candidates, key=lambda c: (priority[c['color']], c.get('score', 0))) if candidates else None
+        raw = selected['color'] if selected else 'None'
+        color = self.confirmation.update(raw)
+        source = selected['source'] if selected else 'none'
+        present = selected is not None
+        debug = dict(raw=raw, confirmed=color, source=source, present=present, yolo_objects=model_count,
+                     box=selected['box'] if selected else None, stamp=stamp)
+        self.publisher.publish(String(data=color))
+        self.presence_pub.publish(Bool(data=present))
+        self.debug_pub.publish(String(data=json.dumps(debug)))
+        display = (color, source, model_count)
+        if display != self.last_display:
+            self.get_logger().info(f'Traffic light: {color} ({source}, YOLO objects={model_count})')
+            self.last_display = display
+        if self.preview_pub.get_subscription_count():
+            import cv2
+            preview = image.copy()
+            if selected is not None:
+                x0, y0, x1, y1 = map(lambda v: int(round(v)), selected['box'])
+                cv2.rectangle(preview, (x0, y0), (x1, y1), (0, 255, 255), 2)
+            cv2.putText(preview, f'{color} ({source})', (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            msg = self.cv_bridge.cv2_to_imgmsg(preview, encoding='bgr8')
+            msg.header = image_msg.header
+            self.preview_pub.publish(msg)
 
 
 def main(args=None):
@@ -93,11 +101,11 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        print("\n\nshutdown\n\n")
+        pass
     finally:
         node.destroy_node()
-        cv2.destroyAllWindows()
         rclpy.try_shutdown()
+
 
 if __name__ == '__main__':
     main()

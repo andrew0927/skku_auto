@@ -28,13 +28,15 @@ class DriveCommand:
 
 class DriveModeController:
     def __init__(self, mode='manual', manual_speed_limit=255, command_timeout=0.5):
-        if mode not in ('manual', 'autonomous'):
-            raise ValueError('Choose manual or autonomous')
+        if mode not in ('manual', 'autonomous', 'parking'):
+            raise ValueError('Choose manual, autonomous or parking')
         self.mode = mode
         self.active = False
         self.manual = DriveCommand()
         self.auto = DriveCommand()
         self.last_auto_time = None
+        self.parking = DriveCommand()
+        self.last_parking_time = None
         self.manual_speed_limit = int(clamp(manual_speed_limit, 0, MAX_DRIVING_SPEED))
         self.command_timeout = command_timeout
 
@@ -42,7 +44,7 @@ class DriveModeController:
     def state(self):
         if self.mode == 'manual':
             return 'manual'
-        return 'autonomous_active' if self.active else 'autonomous_waiting'
+        return f'{self.mode}_active' if self.active else f'{self.mode}_waiting'
 
     def receive_auto(self, command, now):
         self.auto = DriveCommand.bounded(command.steering, command.left_speed,
@@ -54,25 +56,32 @@ class DriveModeController:
         self.manual = DriveCommand()
         self.auto = DriveCommand()
         self.last_auto_time = None
+        self.parking = DriveCommand()
+        self.last_parking_time = None
+
+    def receive_parking(self, command, now):
+        self.parking = DriveCommand.bounded(command.steering, command.left_speed,
+                                           command.right_speed)
+        self.last_parking_time = now
 
     def handle_key(self, key):
         if key in ('q', '\x03'):
             self.stop()
             return 'quit'
-        if key in ('1', '2'):
+        if key in ('1', '2', '3'):
             self.stop()
-            self.mode = 'manual' if key == '1' else 'autonomous'
+            self.mode = {'1': 'manual', '2': 'autonomous', '3': 'parking'}[key]
             return 'mode_changed'
         if key == 'x':
             self.stop()
             return 'stopped'
         if key == ' ':
-            if self.mode == 'autonomous' and not self.active:
+            if self.mode in ('autonomous', 'parking') and not self.active:
                 # Use the latest fresh planner command on the same keypress.
                 # command() still rejects missing or timed-out inputs.
                 self.manual = DriveCommand()
                 self.active = True
-                return 'auto_started'
+                return 'auto_started' if self.mode == 'autonomous' else 'parking_started'
             self.stop()
             return 'stopped'
         if self.mode == 'manual':
@@ -95,6 +104,11 @@ class DriveModeController:
     def command(self, now):
         if self.mode == 'manual':
             return self.manual
+        if self.mode == 'parking':
+            if (self.active and self.last_parking_time is not None
+                    and 0 <= now - self.last_parking_time <= self.command_timeout):
+                return self.parking
+            return DriveCommand()
         if (self.active and self.last_auto_time is not None
                 and 0 <= now - self.last_auto_time <= self.command_timeout):
             return self.auto

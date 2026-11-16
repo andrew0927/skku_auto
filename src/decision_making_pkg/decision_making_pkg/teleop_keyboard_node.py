@@ -1,4 +1,4 @@
-"""1: manual, 2: autonomous waiting, Space: start/pause autonomous driving."""
+"""One output gate for manual driving, lane following and automatic parking."""
 
 import os
 import select
@@ -29,12 +29,17 @@ class TeleopKeyboardNode(Node):
         self.state_pub = self.create_publisher(String, 'driving_mode', state_qos)
         self.auto_sub = self.create_subscription(
             MotionCommand, 'autonomous_control_signal', self.auto_callback, 1)
+        self.parking_sub = self.create_subscription(
+            MotionCommand, 'parking_control_signal', self.parking_callback, 1)
         self.timer = self.create_timer(0.1, self.publish_command)
         self.publish_state()
         self.last_display = None
 
     def auto_callback(self, msg):
         self.controller.receive_auto(msg, time.monotonic())
+
+    def parking_callback(self, msg):
+        self.controller.receive_parking(msg, time.monotonic())
 
     def publish_state(self):
         self.state_pub.publish(String(data=self.controller.state))
@@ -71,17 +76,17 @@ class TeleopKeyboardNode(Node):
 def main(args=None):
     if not sys.stdin.isatty():
         raise SystemExit('Run teleop_keyboard_node in an interactive terminal.')
-    print('1: 수동주행 / 2: 자율주행 대기')
+    print('1: 수동주행 / 2: 자율주행 대기 / 3: 자동주차 대기')
     try:
         while True:
-            choice = input('모드 선택 (1/2): ').strip()
-            if choice in ('1', '2'):
+            choice = input('모드 선택 (1/2/3): ').strip()
+            if choice in ('1', '2', '3'):
                 break
     except (EOFError, KeyboardInterrupt):
         return
     rclpy.init(args=args)
-    node = TeleopKeyboardNode('manual' if choice == '1' else 'autonomous')
-    print('\n1=수동 / 2=자율 대기 / Space=자율 시작·일시정지')
+    node = TeleopKeyboardNode({'1': 'manual', '2': 'autonomous', '3': 'parking'}[choice])
+    print('\n1=수동 / 2=자율 대기 / 3=주차 대기 / Space=시작·일시정지')
     print('w/s=속도 ±10, a/d=조향 ±1, x=정지, q/Ctrl+C=종료')
     settings = termios.tcgetattr(sys.stdin)
     # Ctrl+C and terminal closure also pass through the stop in finally.
