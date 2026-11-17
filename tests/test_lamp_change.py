@@ -25,14 +25,14 @@ def test_dark_lamp_lighting_up_after_red_is_reported_as_green():
     assert detector.reference is None, 'the car still rocks right after stopping'
     assert detector.update(red, BOX, 'Red', stopped=True, now=1.0) == 'Red'
     assert detector.reference is not None
-    # Still red: an Unknown frame does not become green.
-    assert detector.update(red, BOX, 'Unknown', stopped=True, now=1.1) == 'Unknown'
+    # Still red: the lit red lamp is read inside the box even when the colour check said Unknown.
+    assert detector.update(red, BOX, 'Unknown', stopped=True, now=1.1) == 'Red'
     # Red lamp off, right lamp lit but washed out white, box not even detected: light changed.
     assert detector.update(housing(False, True), None, 'None', stopped=True, now=1.5) == 'Green'
     # A red lamp that merely moved (box jitter) is not a change.
     shifted = housing(False, False)
     shifted[104:116, 144:156] = (0, 0, 255)
-    assert detector.update(shifted, BOX, 'Unknown', stopped=True, now=1.6) == 'Unknown'
+    assert detector.update(shifted, BOX, 'Unknown', stopped=True, now=1.6) == 'Red'
     # Leaving the stop clears the reference.
     assert detector.update(housing(False, True), BOX, 'Unknown', stopped=False, now=2.0) == 'Unknown'
     assert detector.reference is None
@@ -73,3 +73,21 @@ def test_lamps_read_from_pixels_while_yolo_misses_the_light():
     image[105:135, 105:135] = (20, 20, 20)
     image[105:135, 185:215] = (150, 255, 120)        # green lamp lit
     assert detector.update(image, None, 'None', stopped=True, now=2.0) == 'Green'
+
+
+
+def test_amber_lamp_is_yellow_and_round_lamps_only():
+    import cv2
+    from camera_perception_pkg.lamp_change import find_lamp_blob, read_lamps
+    image = np.zeros((480, 640, 3), np.uint8)
+    image[100:140, 100:220] = (20, 20, 20)
+    cv2.circle(image, (160, 120), 15, (0, 170, 255), -1)        # amber middle lamp
+    assert read_lamps(image, (100, 100, 220, 140))[0] == 'Yellow'
+    assert find_lamp_blob(image)[0] == 'Yellow'
+    bench = np.zeros((480, 640, 3), np.uint8)
+    bench[150:200, 50:300] = (0, 120, 255)                      # orange bench: not round
+    assert find_lamp_blob(bench) == (None, None)
+    lamp = np.zeros((480, 640, 3), np.uint8)
+    cv2.circle(lamp, (60, 80), 18, (0, 0, 255), -1)             # lit red lamp, YOLO missed it
+    color, box = find_lamp_blob(lamp)
+    assert color == 'Red' and box[0] <= 42 and box[2] > 150      # housing extends to the right

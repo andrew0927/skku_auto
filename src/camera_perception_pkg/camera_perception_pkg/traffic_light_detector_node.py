@@ -20,7 +20,7 @@ from interfaces_pkg.msg import DetectionArray, BoundingBox2D, Detection
 from std_msgs.msg import Bool, String
 
 from .lib import camera_perception_func_lib as CPFL
-from .lamp_change import LampChangeDetector
+from .lamp_change import LampChangeDetector, find_lamp_blob, read_lamps
 
 # ---------------Variable Setting---------------
 # Subscribe할 토픽 이름
@@ -67,6 +67,8 @@ class TrafficLightDetector(Node):
 
         self.publisher = self.create_publisher(String, self.pub_topic, self.qos_profile)
         self.crosswalk_pub = self.create_publisher(Bool, 'crosswalk_near', self.qos_profile)
+        # Any crosswalk in view (seen ~4 s before the stop line): the planner slows down early.
+        self.crosswalk_ahead_pub = self.create_publisher(Bool, 'crosswalk_ahead', self.qos_profile)
         self.state_sub = self.create_subscription(String, 'control_state', self.state_callback, 1)
 
     def state_callback(self, msg: String):
@@ -88,9 +90,16 @@ class TrafficLightDetector(Node):
         light = max(lights, key=lambda d: d.score) if lights else None
         color, box = 'None', None
         if light is not None:
-            color = CPFL.get_traffic_light_color(cv_image, light.bbox, hsv_ranges)
             cx, cy, w, h = light.bbox.center.position.x, light.bbox.center.position.y, light.bbox.size.x, light.bbox.size.y
             box = (int(cx - w / 2), int(cy - h / 2), int(cx + w / 2), int(cy + h / 2))
+            # Lit lamp read inside the box only (amber counts as its own colour).
+            lamp, _ = read_lamps(cv_image, box)
+            color = lamp if lamp is not None else CPFL.get_traffic_light_color(cv_image, light.bbox, hsv_ranges)
+        elif any(d.class_name.casefold() == 'crosswalk' for d in detection_msg.detections):
+            # YOLO misses the light at mid distance; near a crosswalk look for a lit red/amber lamp.
+            lamp, lamp_box = find_lamp_blob(cv_image)
+            if lamp is not None:
+                color, box = lamp, lamp_box
         # While stopped at red, a dark lamp lighting up counts as the light changing.
         changed = self.change.update(cv_image, box, color, self.stopped, time.monotonic())
         note = ''
@@ -110,6 +119,7 @@ class TrafficLightDetector(Node):
         bottoms = [d.bbox.center.position.y + d.bbox.size.y / 2 for d in crosswalks]
         near = bool(bottoms) and max(bottoms) >= self.crosswalk_stop_y
         self.crosswalk_pub.publish(Bool(data=near))
+        self.crosswalk_ahead_pub.publish(Bool(data=bool(crosswalks)))
         if near != self.last_near:
             where = f' (bottom y={max(bottoms):.0f}, stop line {self.crosswalk_stop_y})' if bottoms else ''
             self.get_logger().info(f'Crosswalk near: {near}{where}')

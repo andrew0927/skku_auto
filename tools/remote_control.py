@@ -23,6 +23,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import os
+os.environ.setdefault('ROS_LOCALHOST_ONLY', '1')  # same isolation as run_autonomous.sh
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image

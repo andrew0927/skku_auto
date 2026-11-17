@@ -93,7 +93,7 @@ def test_keyboard_path_and_serial_timeout_without_hardware():
         assert packets[-1] == (0, 0, 0)
         run(0.4)
         assert packets[-1][1] > 0
-        run(0.9, publish=False)
+        run(1.3, publish=False)  # last command is held briefly, then the car must stop
         assert packets[-1] == (0, 0, 0)
         keyboard.process_key('1')
         keyboard.process_key('w')

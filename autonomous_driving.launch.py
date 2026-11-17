@@ -26,9 +26,9 @@ def generate_launch_description():
         'model': (os.environ.get('YOLO_MODEL', str(ws / 'best.pt')), 'YOLO segmentation model'),
         'port': (os.environ.get('ARDUINO_PORT', '/dev/ttyACM0'), 'Arduino serial port'),
         'cruise_speed': (os.environ.get('DRIVING_SPEED_LIMIT', '255'), 'Forward motor PWM, 0..255'),
-        'estimated_speed': ('200', 'Speed when lane2 is estimated from lane1'),
-        'lane_loss_steering': ('4', 'Right steering on brief lane loss, 0..7'),
-        'lane_loss_hold': ('0.4', 'Maximum seconds of recovery on lane loss'),
+        'corner_speed': ('150', 'Speed at full steering (slower in curves); -1 = same as cruise_speed'),
+        'estimated_speed': ('150', 'Speed when lane2 is estimated (uncertain); -1 = same as cruise_speed'),
+        'hold_time': ('0.5', 'Seconds the last moving command is kept at speed 150 (shorter when faster)'),
         'reacquire_hold': ('0.5', 'Seconds at reduced speed after estimated lane tracking'),
         'data_source': ('camera', 'camera, video, or image'),
         'img_dir': (str(ws / 'src/camera_perception_pkg/camera_perception_pkg/lib/Collected_Datasets/sample_dataset'), 'Image input directory'),
@@ -43,8 +43,8 @@ def generate_launch_description():
         'steering_sign': ('1.0', '1 follows the tested firmware convention; -1 reverses commands'),
         'obey_traffic_lights': ('false', 'Enable traffic-light stop logic'),
         'crosswalk_stop_y': ('440', 'Stop for red when the crosswalk bottom edge passes this image y (0..480)'),
-        'red_approach_speed': ('150', 'Speed while approaching the crosswalk after a red light'),
-        'crossing_time': ('4.0', 'Seconds of straight driving after red turns green while lanes are hidden'),
+        'red_approach_speed': ('150', 'Speed approaching/crossing the crosswalk; -1 = same as cruise_speed'),
+        'crossing_time': ('2.5', 'Seconds (at speed 150, shorter when faster) of holding the lane heading after green'),
         'red_release_time': ('3.0', 'Start when red has not been seen for this long (0 disables)'),
         'light_min_score': ('0.5', 'Ignore traffic-light detections below this YOLO score'),
         'enable_camera': ('true', 'Publish camera frames (false when replaying a bag)'),
@@ -64,6 +64,7 @@ def generate_launch_description():
     domain = os.environ.get('ROS_DOMAIN_ID', '10')
     keyboard_cmd = (
         'export TELEOP_MODE="$1" && '
+        f'export ROS_DOMAIN_ID={domain} ROS_LOCALHOST_ONLY={os.environ.get("ROS_LOCALHOST_ONLY", "0")} && '
         'source /opt/ros/humble/setup.bash && '
         f'source {shlex.quote(str(ws / "install/local_setup.bash"))} && '
         'exec ros2 run decision_making_pkg teleop_keyboard_node'
@@ -92,8 +93,8 @@ def generate_launch_description():
              output='both', parameters=[sim_time, {
                  'driving_speed': param('cruise_speed', int),
                  'estimated_speed': param('estimated_speed', int),
-                 'lane_loss_steering': param('lane_loss_steering', int),
-                 'lane_loss_hold': param('lane_loss_hold', float),
+                 'corner_speed': param('corner_speed', int),
+                 'hold_time': param('hold_time', float),
                  'reacquire_hold': param('reacquire_hold', float),
                  'steering_gain': param('steering_gain', float),
                  'steering_offset': param('steering_offset', float),
@@ -127,7 +128,7 @@ def generate_launch_description():
 # Ground truth: planner output, what was actually sent, driving mode and states.
 RECORD_TOPICS = ['/image_raw', '/autonomous_control_signal', '/topic_control_signal',
                  '/driving_mode', '/driving_mode_reset', '/control_state',
-                 '/yolov8_traffic_light_info', '/crosswalk_near', '/lane_tracking_source',
+                 '/yolov8_traffic_light_info', '/crosswalk_near', '/crosswalk_ahead', '/lane_tracking_source',
                  '/override_control_signal', '/remote_key']
 # Inputs a replay feeds back; everything else is recomputed from the frames.
 REPLAY_INPUTS = ['/image_raw', '/driving_mode', '/driving_mode_reset']

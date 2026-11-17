@@ -16,13 +16,58 @@ LAMP_MIN_FRACTION = 0.03
 BOX_MEMORY = 5.0  # s: a light box seen this long before the stop still locates the lamps
 
 
-def lamp_fractions(bgr):
+def lamp_masks(bgr):
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     hue, sat, value = hsv[..., 0], hsv[..., 1], hsv[..., 2]
     bright = value > 180
-    red = bright & (sat > 100) & ((hue <= 12) | (hue >= 165))
+    red = bright & (sat > 100) & ((hue <= 9) | (hue >= 165))
+    yellow = bright & (sat > 100) & (hue >= 10) & (hue <= 32)   # the amber second lamp
     green = bright & (sat > 60) & (hue >= 40) & (hue <= 100)
-    return float(red.mean()), float(green.mean())
+    return {'Red': red, 'Yellow': yellow, 'Green': green}
+
+
+def lamp_fractions(bgr):
+    masks = lamp_masks(bgr)
+    return float(masks['Red'].mean()), float(masks['Green'].mean())
+
+
+def read_lamps(bgr, box):
+    """Colour of the lit lamp inside the light's own box (never the mat around it), or None."""
+    height, width = bgr.shape[:2]
+    x0, y0, x1, y1 = [int(v) for v in box]
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(width, x1), min(height, y1)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None, {}
+    fractions = {k: float(m.mean()) for k, m in lamp_masks(bgr[y0:y1, x0:x1]).items()}
+    color = max(fractions, key=fractions.get)
+    return (color if fractions[color] >= LAMP_MIN_FRACTION else None), fractions
+
+
+def find_lamp_blob(bgr, max_y=300, min_area=120):
+    """A lit red or amber lamp seen above the road when YOLO misses the light: a bright, round
+    blob (benches, jackets and vending machines are not round). Returns (colour, housing box)."""
+    best = None
+    masks = lamp_masks(bgr[:max_y])
+    for color in ('Red', 'Yellow'):
+        mask = cv2.morphologyEx(masks[color].astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < min_area:
+                continue
+            (cx, cy), radius = cv2.minEnclosingCircle(contour)
+            x, y, w, h = cv2.boundingRect(contour)
+            roundness = area / (np.pi * radius * radius)
+            if roundness < 0.55 or not 0.6 <= w / float(h) <= 1.6:
+                continue
+            if best is None or area > best[0]:
+                # The housing holds three lamps side by side (red left, amber middle, green right).
+                lamp = 2 * radius
+                offset = {'Red': 0.0, 'Yellow': 1.1}[color]
+                hx0 = cx - radius - offset * lamp * 1.1
+                box = (hx0 - 0.15 * lamp, cy - 0.75 * lamp, hx0 + 3.4 * lamp, cy + 0.75 * lamp)
+                best = (area, color, tuple(int(v) for v in box))
+    return (best[1], best[2]) if best else (None, None)
 
 
 class LampChangeDetector:
@@ -64,20 +109,18 @@ class LampChangeDetector:
         if self.stop_time is None:
             self.stop_time = now
             if self.seen_box is not None and now - self.seen_time <= BOX_MEMORY:
-                self.lamp_region = self.expand(bgr, self.seen_box, 0.15, 20)
+                self.lamp_region = tuple(int(v) for v in self.seen_box)
         if box is not None:
             self.last_box = box
+            self.lamp_region = tuple(int(v) for v in box)  # follow the light if it is re-detected
+        if self.reference is None and self.last_box is not None and now - self.stop_time >= self.settle:
+            self.capture(bgr, self.last_box)  # armed even while the lamp colour is readable
         if self.lamp_region is not None:
-            x0, y0, x1, y1 = self.lamp_region
-            red, green = lamp_fractions(bgr[y0:y1, x0:x1])
-            self.last_read = (red, green)
-            if red >= LAMP_MIN_FRACTION and red > green:
-                return 'Red'
-            if green >= LAMP_MIN_FRACTION and green > red:
-                return 'Green'
+            lamp, fractions = read_lamps(bgr, self.lamp_region)
+            self.last_read = (fractions.get('Red', 0.0), fractions.get('Green', 0.0))
+            if lamp is not None:
+                return lamp
         if self.reference is None:
-            if self.last_box is not None and now - self.stop_time >= self.settle:
-                self.capture(bgr, self.last_box)
             return color
         if color == 'Red':
             return color

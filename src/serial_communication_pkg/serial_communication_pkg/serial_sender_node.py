@@ -28,6 +28,18 @@ class SerialSenderNode(Node):
         self.subscription = self.create_subscription(MotionCommand, 'topic_control_signal',
                                                      self.data_callback, 1)
         self.timer = self.create_timer(self.send_period, self.timer_callback)
+        self.source_check = self.create_timer(2.0, self.check_sources)
+        self.warned_sources = 0
+
+    def check_sources(self):
+        # Two command sources (e.g. another laptop on the same network and ROS domain) make the car
+        # alternate between their commands. Say so loudly instead of driving in staccato.
+        publishers = self.get_publishers_info_by_topic('topic_control_signal')
+        if len(publishers) > 1 and len(publishers) != self.warned_sources:
+            names = ', '.join(p.node_name for p in publishers)
+            self.get_logger().error(f'{len(publishers)} nodes send car commands ({names}): another computer '
+                                    'or a leftover keyboard window is driving too')
+        self.warned_sources = len(publishers)
 
     def data_callback(self, msg):
         now = time.monotonic()

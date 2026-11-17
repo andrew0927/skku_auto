@@ -8,6 +8,9 @@ if [[ ! -f "$WS_DIR/install/local_setup.bash" ]]; then
 fi
 source "$WS_DIR/install/local_setup.bash"
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-10}"
+# Keep this laptop's nodes to itself: teammates on the same Wi-Fi with the same domain would
+# otherwise also command the car (their idle keyboard node sends stop commands -> staccato).
+export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-1}"
 # 키보드 창(gnome-terminal)은 systemd 서비스가 띄우는데, 그 환경에 DISPLAY가
 # 빠져 있으면 "Cannot open display"로 창이 뜨지 않음. 현재 화면 정보를 넘겨줌.
 if [[ -n "${DISPLAY:-}" ]]; then

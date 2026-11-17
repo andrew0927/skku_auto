@@ -9,6 +9,8 @@ autonomous_active (someone paused). State changes are printed as they happen.
 import sys
 import time
 
+import os
+os.environ.setdefault('ROS_LOCALHOST_ONLY', '1')  # same isolation as run_autonomous.sh
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
