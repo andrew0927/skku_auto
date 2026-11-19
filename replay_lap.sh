@@ -16,11 +16,13 @@ source /opt/ros/humble/setup.bash
 source "$WS_DIR/install/local_setup.bash"
 # 실차 세션(도메인 10)과 섞이지 않도록 별도 도메인 사용
 export ROS_DOMAIN_ID="${REPLAY_DOMAIN_ID:-77}"
-mapfile -t recorded < "$lap/launch_args.txt"
+# 값이 빈 인자(keyboard_mode:= 등)는 ros2 launch가 거부하므로 제외
+# REPLAY_DROP='정규식' 으로 기록된 인자 중 일부(예: 예전 튜닝값)를 빼고 현재 기본값으로 재생
+mapfile -t recorded < <(grep -v ':=$' "$lap/launch_args.txt" | grep -v -E "^(${REPLAY_DROP:-__keep_all__}):=")
 shopt -s nullglob
 before=("$lap"/replay_*)
 ros2 launch "$WS_DIR/autonomous_driving.launch.py" "${recorded[@]}" \
-  enable_camera:=false enable_serial:=false enable_teleop:=false \
+  enable_camera:=false enable_serial:=false enable_teleop:=false enable_lidar:=false \
   use_sim_time:=true record:=false replay_bag:="$lap/bag" show_image:=false "$@" || true
 after=("$lap"/replay_*)
 if (( ${#after[@]} <= ${#before[@]} )); then

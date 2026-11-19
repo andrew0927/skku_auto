@@ -1,91 +1,82 @@
+"""Obstacle straight ahead in the car's own lane, from the processed lidar scan.
+
+The scan (lidar_processed) has one range per degree, 0 deg = straight ahead and angles growing to
+the left (the processor flips the RPLidar's clockwise order). Each point is turned into forward (x)
+and left (y) distances; an obstacle is in the lane when enough points lie in a corridor as wide as
+the car in front of it. A car in the other lane is about one lane width to the side and is ignored,
+which an angular sector cannot do (on curves the sector points into the other lane).
+
+Publishes lidar_obstacle_info (Bool, debounced) and lidar_obstacle_offset (Float32: left offset in m
+of the nearest corridor point, NaN when there is none).
+"""
+
+import math
+
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSDurabilityPolicy, QoSReliabilityPolicy
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool
-
-from rclpy.qos import QoSProfile
-from rclpy.qos import QoSHistoryPolicy
-from rclpy.qos import QoSDurabilityPolicy
-from rclpy.qos import QoSReliabilityPolicy
+from std_msgs.msg import Bool, Float32
 
 from .lib import lidar_perception_func_lib as LPFL
 
-#---------------Variable Setting---------------
-# Subscribe할 토픽 이름
-SUB_TOPIC_NAME = 'lidar_processed'  # 구독할 토픽 이름
+SUB_TOPIC_NAME = 'lidar_processed'
+PUB_TOPIC_NAME = 'lidar_obstacle_info'
 
-# Publish할 토픽 이름
-PUB_TOPIC_NAME = 'lidar_obstacle_info'  # 물체 감지 여부를 퍼블리시할 토픽 이름
-#----------------------------------------------
+
+def corridor_points(ranges, angle_min, angle_increment, ahead_min, ahead_max, half_width):
+    """(x, y) of scan points in the corridor ahead: ahead_min <= x <= ahead_max, |y| <= half_width."""
+    points = []
+    for index, distance in enumerate(ranges):
+        if not math.isfinite(distance) or distance <= 0.0:
+            continue
+        angle = angle_min + index * angle_increment
+        x, y = distance * math.cos(angle), distance * math.sin(angle)
+        if ahead_min <= x <= ahead_max and abs(y) <= half_width:
+            points.append((x, y))
+    return points
 
 
 class ObjectDetection(Node):
     def __init__(self):
         super().__init__('lidar_obstacle_detector_node')
-
-        self.qos_profile = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            durability=QoSDurabilityPolicy.VOLATILE,
-            depth=1
-        )
-
-        self.subscriber = self.create_subscription(LaserScan, SUB_TOPIC_NAME, self.lidar_callback, self.qos_profile)
-        self.publisher = self.create_publisher(Bool, PUB_TOPIC_NAME, self.qos_profile) 
-
-        self.detection_checker = LPFL.StabilityDetector(consec_count=5) # 연속적으로 몇 번 감지 여부를 확인할지 설정
-
-
-
+        qos = QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE, history=QoSHistoryPolicy.KEEP_LAST,
+                         durability=QoSDurabilityPolicy.VOLATILE, depth=1)
+        self.ahead_min = self.declare_parameter('ahead_min', 0.15).value      # m in front of the lidar
+        self.ahead_max = self.declare_parameter('ahead_max', 1.5).value
+        self.half_width = self.declare_parameter('half_width', 0.3).value     # m each side: car width
+        self.min_points = self.declare_parameter('min_points', 2).value       # ignore single echoes
+        self.detection_checker = LPFL.StabilityDetector(consec_count=self.declare_parameter('consec_count', 3).value)
+        self.subscriber = self.create_subscription(LaserScan, SUB_TOPIC_NAME, self.lidar_callback, qos)
+        self.publisher = self.create_publisher(Bool, PUB_TOPIC_NAME, qos)
+        self.offset_pub = self.create_publisher(Float32, 'lidar_obstacle_offset', qos)
+        self.last_result = None
 
     def lidar_callback(self, msg):
-         
-        start_angle = 0  # 원하는 각도 범위의 시작 값
-        end_angle = 30  # 원하는 각도 범위의 끝 값
-        
-        range_min = 0.5  # 원하는 거리 범위의 최소값 [m]
-        range_max = 2.0  # 원하는 거리 범위의 최대값 [m]
+        points = corridor_points(msg.ranges, msg.angle_min, msg.angle_increment,
+                                 self.ahead_min, self.ahead_max, self.half_width)
+        detected = len(points) >= self.min_points
+        result = self.detection_checker.check_consecutive_detections(detected)
+        self.publisher.publish(Bool(data=result))
+        nearest = min(points) if points else None
+        self.offset_pub.publish(Float32(data=nearest[1] if nearest else float('nan')))
+        if result != self.last_result:  # log changes only, with where the obstacle is
+            where = f' at {nearest[0]:.2f} m ahead, {nearest[1]:+.2f} m left' if nearest else ''
+            self.get_logger().info(f'Lidar Obstacle detected: {result}{where}')
+            self.last_result = result
 
-        ranges = msg.ranges
-
-
-        detected = LPFL.detect_object(ranges=ranges, start_angle=start_angle, end_angle=end_angle, range_min=range_min, range_max=range_max)
-        
-        # ranges는 라이다 센서값 입력                                                        
-
-        # 각도 범위 지정
-        # 예시 1) 
-        # start_angle을 355도로, end_angle을 4도로 설정하면, 
-        # 355도에서 4도까지의 모든 각도(355, 356, 357, 358, 359, 0, 1, 2, 3, 4도)가 포함.
-        # 
-        # 예시 2)
-        # start_angle을 0도로, end_angle을 30도로 설정하면, 
-        # 0도에서 30도까지의 모든 각도(0, 1, 2, ..., 30도)가 포함.
-        # 
-        # 예시 3)
-        # start_angle을 180도로, end_angle을 190도로 설정하면, 
-        # 180도에서 190도까지의 모든 각도(180, 181, 182, ..., 190도)가 포함. 
-
-        # 거리범위 지정 
-        # range_min보다 크거나 같고, range_max보다 작거나 같은 거리값을 포함.
-
-        # 각도범위 및 거리범위를 둘 다 만족하는 범위에 라이다 센서값이 존재하면 True, 아니면 False 리턴. 
-
-
-        detection_result = self.detection_checker.check_consecutive_detections(detected)
-
-        detection_msg = Bool()
-        detection_msg.data = detection_result
-        self.publisher.publish(detection_msg)
-
-        self.get_logger().info(f'Lidar Obstacle detected: {detection_result}')
 
 def main(args=None):
     rclpy.init(args=args)
-    object_detection_node = ObjectDetection()
-    rclpy.spin(object_detection_node)
-    object_detection_node.destroy_node()
-    rclpy.shutdown()
+    node = ObjectDetection()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
 
 if __name__ == '__main__':
     main()

@@ -10,7 +10,7 @@ import sys
 import time
 
 import os
-os.environ.setdefault('ROS_LOCALHOST_ONLY', '1')  # same isolation as run_autonomous.sh
+os.environ['ROS_LOCALHOST_ONLY'] = os.environ.get('CAR_LOCALHOST_ONLY', '1')  # as run_autonomous.sh
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy

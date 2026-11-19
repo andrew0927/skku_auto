@@ -47,7 +47,7 @@ class LidarSensorDataProcessor(Node):
         msg = LPFL.rotate_lidar_data(msg, offset = 0) # offset은 0부터 359까지의 값을 입력
         msg = LPFL.flip_lidar_data(msg, pivot_angle = 0) # pivot_angle은 0부터 359까지의 값을 입력
         self.publisher.publish(msg)
-        self.get_logger().info(f'Received scan with {len(ranges)} ranges and {len(intensities)} intensities')
+        self.get_logger().debug(f'Received scan with {len(ranges)} ranges and {len(intensities)} intensities')
 
 def main(args=None):
     rclpy.init(args=args)

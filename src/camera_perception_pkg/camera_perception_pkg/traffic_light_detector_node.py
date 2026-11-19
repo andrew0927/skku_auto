@@ -42,6 +42,9 @@ class TrafficLightDetector(Node):
         self.show_image = self.declare_parameter('show_image', False).value
         # 횡단보도 박스 아래쪽 끝이 이 y(픽셀, 640x480 기준)보다 아래로 오면 '가까움'
         self.crosswalk_stop_y = self.declare_parameter('crosswalk_stop_y', 440).value
+        # A crosswalk at the stop line is >120 px tall; a white line across the road at the bottom
+        # of the image was detected as a thin crosswalk and stopped the car on a straight.
+        self.crosswalk_min_height = self.declare_parameter('crosswalk_min_height', 60).value
         # YOLO boxes below this score are ignored (dark red objects were reported as lights).
         self.min_score = self.declare_parameter('min_score', 0.5).value
         # Crops are saved whenever the reported colour changes, for tuning the colour ranges.
@@ -116,7 +119,8 @@ class TrafficLightDetector(Node):
             self.save_sample(cv_image, box, color)
 
         crosswalks = [d for d in detection_msg.detections if d.class_name.casefold() == 'crosswalk']
-        bottoms = [d.bbox.center.position.y + d.bbox.size.y / 2 for d in crosswalks]
+        bottoms = [d.bbox.center.position.y + d.bbox.size.y / 2 for d in crosswalks
+                   if d.bbox.size.y >= self.crosswalk_min_height]
         near = bool(bottoms) and max(bottoms) >= self.crosswalk_stop_y
         self.crosswalk_pub.publish(Bool(data=near))
         self.crosswalk_ahead_pub.publish(Bool(data=bool(crosswalks)))

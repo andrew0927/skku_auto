@@ -43,11 +43,17 @@ def read_lamps(bgr, box):
     return (color if fractions[color] >= LAMP_MIN_FRACTION else None), fractions
 
 
-def find_lamp_blob(bgr, max_y=300, min_area=120):
+def find_lamp_blob(bgr, max_y=300, min_area=1000, min_core=0.1):
     """A lit red or amber lamp seen above the road when YOLO misses the light: a bright, round
-    blob (benches, jackets and vending machines are not round). Returns (colour, housing box)."""
+    blob (benches, jackets and vending machines are not round) with a glowing core: at least
+    min_core of it nearly white (V > 245). A lit LED saturates the camera (18-81 % on the track's
+    light); an orange bench or pillar in room light does not (0 %), and was read as amber.
+    It is only used near a crosswalk, where the lamp is big (4000-28000 px on 11-13..11-18); the
+    lit red screen of the vending machines (140-280 px) passed every other check, hence min_area.
+    Returns (colour, housing box)."""
     best = None
     masks = lamp_masks(bgr[:max_y])
+    value = cv2.cvtColor(bgr[:max_y], cv2.COLOR_BGR2HSV)[..., 2]
     for color in ('Red', 'Yellow'):
         mask = cv2.morphologyEx(masks[color].astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -58,7 +64,18 @@ def find_lamp_blob(bgr, max_y=300, min_area=120):
             (cx, cy), radius = cv2.minEnclosingCircle(contour)
             x, y, w, h = cv2.boundingRect(contour)
             roundness = area / (np.pi * radius * radius)
-            if roundness < 0.55 or not 0.6 <= w / float(h) <= 1.6:
+            # A light cut by the image edge (the car turning in front of it, 11-17 and 11-18) is
+            # not round: a large edge blob only needs to be roughly compact; the lit core below
+            # still rules out benches.
+            at_edge = x <= 1 or y <= 1 or x + w >= bgr.shape[1] - 2
+            if at_edge:
+                if roundness < 0.25:
+                    continue
+            elif roundness < 0.55 or not 0.6 <= w / float(h) <= 1.6:
+                continue
+            inside = np.zeros(value.shape, np.uint8)
+            cv2.drawContours(inside, [contour], -1, 255, -1)
+            if float((value[inside > 0] > 245).mean()) < min_core:
                 continue
             if best is None or area > best[0]:
                 # The housing holds three lamps side by side (red left, amber middle, green right).

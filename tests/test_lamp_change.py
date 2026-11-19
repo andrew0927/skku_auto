@@ -62,7 +62,7 @@ def test_green_lamp_detected_even_when_the_red_lamp_is_out_of_view():
 
 def test_lamps_read_from_pixels_while_yolo_misses_the_light():
     image = np.zeros((480, 640, 3), np.uint8)
-    image[100:140, 100:220] = (20, 20, 20)
+    image[90:150, 100:220] = (20, 20, 20)
     image[105:135, 105:135] = (0, 0, 255)            # red lamp lit
     box = (100, 100, 220, 140)
     detector = LampChangeDetector()
@@ -80,14 +80,40 @@ def test_amber_lamp_is_yellow_and_round_lamps_only():
     import cv2
     from camera_perception_pkg.lamp_change import find_lamp_blob, read_lamps
     image = np.zeros((480, 640, 3), np.uint8)
-    image[100:140, 100:220] = (20, 20, 20)
-    cv2.circle(image, (160, 120), 15, (0, 170, 255), -1)        # amber middle lamp
+    image[90:150, 100:220] = (20, 20, 20)
+    cv2.circle(image, (160, 120), 22, (0, 170, 255), -1)        # amber middle lamp (close)
     assert read_lamps(image, (100, 100, 220, 140))[0] == 'Yellow'
     assert find_lamp_blob(image)[0] == 'Yellow'
     bench = np.zeros((480, 640, 3), np.uint8)
     bench[150:200, 50:300] = (0, 120, 255)                      # orange bench: not round
     assert find_lamp_blob(bench) == (None, None)
     lamp = np.zeros((480, 640, 3), np.uint8)
-    cv2.circle(lamp, (60, 80), 18, (0, 0, 255), -1)             # lit red lamp, YOLO missed it
+    cv2.circle(lamp, (60, 80), 22, (0, 0, 255), -1)             # lit red lamp, YOLO missed it
     color, box = find_lamp_blob(lamp)
     assert color == 'Red' and box[0] <= 42 and box[2] > 150      # housing extends to the right
+
+
+def test_dull_orange_block_is_not_an_amber_lamp():
+    # The orange bench seen on 11-18: bright (V~220) and orange, roughly square, but no glowing core.
+    from camera_perception_pkg.lamp_change import find_lamp_blob
+    bench = np.zeros((480, 640, 3), np.uint8)
+    bench[180:230, 100:160] = (40, 130, 220)
+    assert find_lamp_blob(bench) == (None, None)
+
+
+def test_vending_machine_screen_is_not_a_lamp():
+    import cv2
+    from camera_perception_pkg.lamp_change import find_lamp_blob
+    image = np.zeros((480, 640, 3), np.uint8)
+    cv2.circle(image, (130, 176), 7, (0, 0, 255), -1)          # small lit red screen, area ~150
+    assert find_lamp_blob(image) == (None, None)
+
+
+def test_lamp_cut_by_the_image_edge_is_found():
+    import cv2
+    from camera_perception_pkg.lamp_change import find_lamp_blob
+    image = np.zeros((480, 640, 3), np.uint8)
+    cv2.circle(image, (10, 90), 60, (0, 0, 255), -1)            # half outside the image
+    cv2.circle(image, (10, 90), 25, (255, 255, 255), -1)        # saturated core
+    assert find_lamp_blob(image)[0] == 'Red'
+

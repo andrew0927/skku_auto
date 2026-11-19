@@ -23,6 +23,7 @@ setup(
             'image_publisher_node = camera_perception_pkg.image_publisher_node:main',
             'yolov8_node = camera_perception_pkg.yolov8_node:main',
             'traffic_light_detector_node = camera_perception_pkg.traffic_light_detector_node:main',
+            'vehicle_detector_node = camera_perception_pkg.vehicle_detector_node:main',
             'lane_info_extractor_node = camera_perception_pkg.lane_info_extractor_node:main',
         ],
     },

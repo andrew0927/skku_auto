@@ -31,15 +31,37 @@ def region_centers(roi, heights=TARGET_HEIGHTS):
 
 
 class LaneCenterTracker:
-    def __init__(self, pair_timeout=2.0, slope_timeout=1.0):
+    def __init__(self, pair_timeout=2.0, slope_timeout=1.0, switch_window=8.0):
         self.pair_timeout = pair_timeout
         self.slope_timeout = slope_timeout
+        # After the followed lane changes (obstacle avoidance) the new lane is mostly outside the
+        # bird's-eye ROI until the car is over it, so it is placed one lane spacing from the lane
+        # still in view, using the last measured spacing however old, for switch_window seconds.
+        self.switch_window = switch_window
+        self.switch_time = None
         self.pairs = {}
         self.last_slope = None  # (dx per ROI row, time) of the last lane seen at >= 2 heights
 
     def reset(self):
         self.pairs.clear()
         self.last_slope = None
+        self.switch_time = None
+
+    def switch_target(self, now):
+        """The followed lane changed: keep the measured spacings to place the new lane."""
+        self.switch_time = now
+        self.last_slope = None
+
+    def spacing(self, index, now):
+        pair = self.pairs.get(index)
+        if pair is not None and 0 <= now - pair[1] <= self.pair_timeout:
+            return pair[0]
+        if self.switch_time is not None and 0 <= now - self.switch_time <= self.switch_window:
+            if pair is not None:
+                return pair[0]
+            known = [p[0] for p in self.pairs.values()]
+            return float(np.median(known)) if known else float(ROAD_X[1] - ROAD_X[0])
+        return None
 
     def extend_straight(self, chosen, valid, now):
         """Fill missing heights by extending the visible lane centers in a straight line."""
@@ -121,10 +143,9 @@ class LaneCenterTracker:
         other = one if target_lane == 'lane2' else two
         estimated = False
         for index, x in enumerate(chosen):
-            pair = self.pairs.get(index)
-            if (x is None and other[index] is not None and pair is not None
-                    and 0 <= now - pair[1] <= self.pair_timeout):
-                x = other[index] + (pair[0] if target_lane == 'lane2' else -pair[0])
+            spacing = self.spacing(index, now) if x is None and other[index] is not None else None
+            if spacing is not None:
+                x = other[index] + (spacing if target_lane == 'lane2' else -spacing)
                 chosen[index] = x if 0 <= x < 640 else None
                 estimated = True
         valid = [i for i, x in enumerate(chosen) if x is not None]
@@ -170,3 +191,5 @@ def far_extend(near, far_centers):
             x = float(slope * (ROI_TOP + y) + intercept)
             filled[index] = x if 0 <= x < 640 else None
     return filled if sum(x is not None for x in filled) >= 2 else None
+
+

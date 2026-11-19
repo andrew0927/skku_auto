@@ -13,7 +13,7 @@ from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, ExecuteProcess, OpaqueFunction,
                             SetEnvironmentVariable, Shutdown, TimerAction)
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -29,6 +29,10 @@ def generate_launch_description():
         'corner_speed': ('150', 'Speed at full steering (slower in curves); -1 = same as cruise_speed'),
         'estimated_speed': ('150', 'Speed when lane2 is estimated (uncertain); -1 = same as cruise_speed'),
         'hold_time': ('0.5', 'Seconds the last moving command is kept at speed 150 (shorter when faster)'),
+        'avoid_speed': ('150', 'Lane change: speed cap while passing a car (manual demo run_04: 140-150)'),
+        'avoid_start_y': ('440', 'Lane change starts when the car ahead (box bottom) passes this image row (~1 m)'),
+        'avoid_steer': ('7', 'Lane change: full lock out for a 15 step*s turn, then back; ends early when the segmentation shows the new lane'),
+        'lost_hold_time': ('1.5', 'Lane lost: seconds driven on the recent road steering at 150 before stopping'),
         'reacquire_hold': ('0.5', 'Seconds at reduced speed after estimated lane tracking'),
         'data_source': ('camera', 'camera, video, or image'),
         'img_dir': (str(ws / 'src/camera_perception_pkg/camera_perception_pkg/lib/Collected_Datasets/sample_dataset'), 'Image input directory'),
@@ -37,7 +41,7 @@ def generate_launch_description():
         'show_image': ('true', 'Show camera, both lane masks, and target centers'),
         'enable_serial': ('true', 'Enable physical Arduino connection'),
         'enable_teleop': ('true', 'Open keyboard mode selection terminal'),
-        'target_lane': ('lane2', 'Preferred lane: lane1 or lane2'),
+        'lane': ('2', 'Lane the car starts in: 1 or 2 (it keeps to it until an obstacle)'),
         'steering_gain': ('0.12', 'Steering steps per degree of image heading error'),
         'steering_offset': ('0.0', 'Logical steering offset; Arduino calibration is unchanged'),
         'steering_sign': ('1.0', '1 follows the tested firmware convention; -1 reverses commands'),
@@ -47,6 +51,11 @@ def generate_launch_description():
         'crossing_time': ('2.5', 'Seconds (at speed 150, shorter when faster) of holding the lane heading after green'),
         'red_release_time': ('3.0', 'Start when red has not been seen for this long (0 disables)'),
         'light_min_score': ('0.5', 'Ignore traffic-light detections below this YOLO score'),
+        'avoid_obstacles': ('true', 'Move to the other lane when a car is ahead in this lane'),
+        'vehicle_backend': ('hybridnets', 'Car detector: hybridnets (TorchScript, GPU if available) or yolo (COCO)'),
+        'vehicle_model': (str(ws / 'models' / 'yolov8n.pt'), 'COCO model for vehicle_backend:=yolo'),
+        'enable_lidar': ('false', 'Also use the RPLidar for obstacles (needs avoid_obstacles)'),
+        'lidar_port': ('/dev/ttyUSB0', 'RPLidar serial port'),
         'enable_camera': ('true', 'Publish camera frames (false when replaying a bag)'),
         'use_sim_time': ('false', 'Follow the /clock of a replayed bag'),
         'record': ('false', 'Record camera frames and commands into laps/'),
@@ -85,7 +94,7 @@ def generate_launch_description():
              on_exit=stop_on_exit('YOLO')),
         Node(package='camera_perception_pkg', executable='lane_info_extractor_node',
              output='screen', parameters=[sim_time, {'show_image': param('show_image', bool),
-                                                      'target_lane': param('target_lane', str)}],
+                                                      'target_lane': ParameterValue(['lane', LaunchConfiguration('lane')], value_type=str)}],
              on_exit=stop_on_exit('lane extractor')),
         Node(package='decision_making_pkg', executable='path_planner_node',
              output='screen', parameters=[sim_time], on_exit=stop_on_exit('path planner')),
@@ -95,6 +104,10 @@ def generate_launch_description():
                  'estimated_speed': param('estimated_speed', int),
                  'corner_speed': param('corner_speed', int),
                  'hold_time': param('hold_time', float),
+                 'avoid_speed': param('avoid_speed', int),
+                 'avoid_start_y': param('avoid_start_y', float),
+                 'avoid_steer': param('avoid_steer', int),
+                 'lost_hold_time': param('lost_hold_time', float),
                  'reacquire_hold': param('reacquire_hold', float),
                  'steering_gain': param('steering_gain', float),
                  'steering_offset': param('steering_offset', float),
@@ -103,6 +116,8 @@ def generate_launch_description():
                  'red_approach_speed': param('red_approach_speed', int),
                  'crossing_time': param('crossing_time', float),
                  'red_release_time': param('red_release_time', float),
+                 'avoid_obstacles': param('avoid_obstacles', bool),
+                 'start_lane': ParameterValue(['lane', LaunchConfiguration('lane')], value_type=str),
              }], on_exit=stop_on_exit('motion planner')),
         Node(package='camera_perception_pkg', executable='traffic_light_detector_node',
              output='both', parameters=[sim_time, {'show_image': param('show_image', bool),
@@ -110,6 +125,22 @@ def generate_launch_description():
                                           'min_score': param('light_min_score', float)}],
              condition=IfCondition(LaunchConfiguration('obey_traffic_lights')),
              on_exit=stop_on_exit('traffic light detector')),
+        # Cars from a second YOLO model (camera); placed in lanes by the lane extractor.
+        Node(package='camera_perception_pkg', executable='vehicle_detector_node', output='both',
+             parameters=[sim_time, {'model': param('vehicle_model', str), 'device': param('device', str),
+                                         'backend': param('vehicle_backend', str),
+                                         'hybridnets_model': str(ws / 'models' / 'hybridnets_384x512' / 'hybridnets_384x512.torchscript.pt'),
+                                         'hybridnets_anchors': str(ws / 'models' / 'hybridnets_384x512' / 'anchors_384x512.npy')}],
+             condition=IfCondition(LaunchConfiguration('avoid_obstacles'))),
+        # Lidar (only with avoid_obstacles:=true). A missing lidar does not stop the drive: the
+        # planner then warns and drives without avoidance.
+        Node(package='lidar_perception_pkg', executable='lidar_publisher_node', output='screen',
+             parameters=[{'port': param('lidar_port', str)}],
+             condition=IfCondition(PythonExpression(["'", LaunchConfiguration('avoid_obstacles'), "' == 'true' and '", LaunchConfiguration('enable_lidar'), "' == 'true'"]))),
+        Node(package='lidar_perception_pkg', executable='lidar_processor_node', output='screen',
+             condition=IfCondition(PythonExpression(["'", LaunchConfiguration('avoid_obstacles'), "' == 'true' and '", LaunchConfiguration('enable_lidar'), "' == 'true'"]))),
+        Node(package='lidar_perception_pkg', executable='lidar_obstacle_detector_node', output='both',
+             condition=IfCondition(PythonExpression(["'", LaunchConfiguration('avoid_obstacles'), "' == 'true' and '", LaunchConfiguration('enable_lidar'), "' == 'true'"]))),
         Node(package='serial_communication_pkg', executable='serial_sender_node',
              output='screen', parameters=[{'port': param('port', str)}],
              condition=IfCondition(LaunchConfiguration('enable_serial')),
@@ -129,13 +160,15 @@ def generate_launch_description():
 RECORD_TOPICS = ['/image_raw', '/autonomous_control_signal', '/topic_control_signal',
                  '/driving_mode', '/driving_mode_reset', '/control_state',
                  '/yolov8_traffic_light_info', '/crosswalk_near', '/crosswalk_ahead', '/lane_tracking_source',
-                 '/override_control_signal', '/remote_key']
+                 '/override_control_signal', '/remote_key', '/lidar_obstacle_info', '/target_lane',
+                 '/lidar_obstacle_offset', '/lidar_processed', '/vehicle_detections',
+                 '/camera_obstacle_info', '/camera_obstacle_other', '/camera_obstacle_box', '/lane_under_car']
 # Inputs a replay feeds back; everything else is recomputed from the frames.
-REPLAY_INPUTS = ['/image_raw', '/driving_mode', '/driving_mode_reset']
+REPLAY_INPUTS = ['/image_raw', '/driving_mode', '/driving_mode_reset', '/lidar_obstacle_info']
 REPLAY_OUTPUTS = ['/autonomous_control_signal', '/control_state', '/yolov8_traffic_light_info',
                   '/crosswalk_near', '/lane_tracking_source']
 # Settings that describe the hardware session, not the driving logic.
-NOT_REPLAYED = {'cam_num', 'port', 'data_source', 'img_dir', 'video_path', 'enable_serial',
+NOT_REPLAYED = {'cam_num', 'port', 'data_source', 'img_dir', 'video_path', 'enable_serial', 'enable_lidar', 'lidar_port',
                 'enable_teleop', 'enable_camera', 'use_sim_time', 'record', 'replay_bag',
                 'replay_delay', 'show_image', 'device'}
 

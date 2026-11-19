@@ -98,3 +98,25 @@ def test_far_lane_fills_near_rows_when_near_lane_is_hidden():
     far_only = lane_polygon('lane2', [[220, 0], [360, 0], [360, ROI_TOP - 10], [220, ROI_TOP - 10]])
     centers, source, _, _ = LaneCenterTracker().update([far_only], 'lane2', 0)
     assert source == 'estimated' and centers == pytest.approx([290] * 3, abs=6)
+
+
+def test_switching_to_lane1_places_it_one_spacing_left_of_lane2():
+    tracker = LaneCenterTracker(pair_timeout=2.0)
+    one, two = lane('lane1', 40, 180), lane('lane2', 220, 360)
+    tracker.update([one, two], 'lane2', 0)                         # spacing measured here
+    seen_lane1, _, _, _ = LaneCenterTracker().update([one], 'lane1', 0)
+    # 10 s later an obstacle: switch to lane1, but only lane2 is in view.
+    tracker.switch_target(10.0)
+    est, source, _, _ = tracker.update([two], 'lane1', 10.1)
+    assert source == 'estimated'
+    assert est == pytest.approx(seen_lane1, abs=3)                 # where lane1 really was
+    # Without the switch, a 10 s old spacing is not trusted.
+    stale, source, _, _ = LaneCenterTracker().update([two], 'lane1', 10.1)
+    assert stale is None and source == 'lost'
+
+
+def test_switch_without_any_measured_spacing_uses_the_lane_width():
+    tracker = LaneCenterTracker()
+    tracker.switch_target(0.0)
+    est, source, _, _ = tracker.update([lane('lane2', 220, 360)], 'lane1', 0.1)
+    assert source == 'estimated' and est == pytest.approx([290 - 256] * 3, abs=6)

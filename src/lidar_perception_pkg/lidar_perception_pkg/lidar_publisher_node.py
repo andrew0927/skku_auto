@@ -26,6 +26,7 @@ LIDAR_PORT = '/dev/ttyUSB0'
 class LidarSensorDataPublisher(Node):
     def __init__(self):
         super().__init__('lidar_publisher_node')
+        self.port = self.declare_parameter('port', LIDAR_PORT).value
 
         self.qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -46,7 +47,7 @@ class LidarSensorDataPublisher(Node):
     def initialize_lidar(self):
         """Initialize the RPLidar."""
         try:
-            self.lidar = LPFL.RPLidar(LIDAR_PORT)
+            self.lidar = LPFL.RPLidar(self.port)
             self.lidar_sensor_data_generator = self.lidar.iter_scans()
         except LPFL.RPLidarException as e:
             self.get_logger().error(f'Failed to initialize LIDAR: {e}')
