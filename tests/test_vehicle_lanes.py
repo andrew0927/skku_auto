@@ -111,3 +111,65 @@ def test_car_on_the_line_at_the_image_edge_uses_the_lane_mask():
     finally:
         rclpy.try_shutdown()
 
+
+
+def test_car_in_my_lane_stays_mine_when_too_close_to_read_its_lane():
+    # 11-19 lap 202105 207.3-211.6 s (recorded boxes): lane2 until y 439, then '' and no road in front
+    # of it; it dropped out of my lane and the car drove into it.
+    import rclpy
+    from types import SimpleNamespace
+    from interfaces_pkg.msg import DetectionArray, Detection, BoundingBox2D
+    from camera_perception_pkg.lane_info_extractor_node import Yolov8InfoExtractor
+    rclpy.init()
+    try:
+        node = Yolov8InfoExtractor(parameter_overrides=[rclpy.parameter.Parameter('show_image', value=False)])
+        node.target_lane = 'lane2'
+        got = []
+        node.own_pub = SimpleNamespace(publish=lambda m: got.append(m.data))
+        def car(x0, y0, x1, y1, side):
+            d = Detection(class_name='car', id=side); d.bbox = BoundingBox2D()
+            d.bbox.center.position.x, d.bbox.center.position.y = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            d.bbox.size.x, d.bbox.size.y = float(x1 - x0), float(y1 - y0)
+            return d
+        for box, side in (((126, 256, 403, 439), 'lane2'), ((121, 257, 406, 450), ''),
+                          ((117, 259, 408, 457), ''), ((112, 264, 411, 460), '')):
+            msg = DetectionArray(); msg.detections = [car(*box, side)]
+            node.vehicle_callback(msg)
+            assert got[-1] is True
+        node.target_lane = 'lane1'                # we changed lanes: the same car is not ours any more
+        node.under_history.clear()
+        msg = DetectionArray(); msg.detections = [car(120, 266, 420, 380, '')]
+        node.vehicle_callback(msg)
+        assert got[-1] is False
+        node.own_track = None                     # an unknown car never seen in my lane is not ours
+        msg = DetectionArray(); msg.detections = [car(500, 250, 630, 330, '')]
+        node.vehicle_callback(msg)
+        assert got[-1] is False
+        node.destroy_node()
+    finally:
+        rclpy.try_shutdown()
+
+
+def test_lane_mask_never_makes_an_unknown_car_mine():
+    # 11-20 lap 152618 24 s / 120 s: lane1 car at the left edge (x 1-140 y 303-308), id '' from the
+    # centre line; the lane2 mask under it made it "mine" and the car turned left into it.
+    import numpy as np, rclpy
+    from types import SimpleNamespace
+    from interfaces_pkg.msg import DetectionArray, Detection, BoundingBox2D
+    from camera_perception_pkg.lane_info_extractor_node import Yolov8InfoExtractor
+    rclpy.init()
+    try:
+        node = Yolov8InfoExtractor(parameter_overrides=[rclpy.parameter.Parameter('show_image', value=False)])
+        node.target_lane = 'lane2'
+        got = []
+        node.own_pub = SimpleNamespace(publish=lambda m: got.append(m.data))
+        lane2 = np.full((480, 640), 255, np.uint8)            # segmentation: lane2 under everything
+        node.masks = {'lane1': np.zeros((480, 640), np.uint8), 'lane2': lane2}
+        d = Detection(class_name='car', id=''); d.bbox = BoundingBox2D()
+        d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.size.x, d.bbox.size.y = 70.0, 262.0, 140.0, 90.0
+        msg = DetectionArray(); msg.detections = [d]
+        node.vehicle_callback(msg)
+        assert got[-1] is False
+        node.destroy_node()
+    finally:
+        rclpy.try_shutdown()

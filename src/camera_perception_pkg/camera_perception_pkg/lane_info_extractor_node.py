@@ -48,6 +48,11 @@ class Yolov8InfoExtractor(Node):
         # nearest car anywhere (followed by the planner while it passes, when its lane changes).
         self.box_pub = self.create_publisher(Float32MultiArray, 'camera_obstacle_box', 1)
         self.last_report = None
+        # The last car counted in my lane (box, time). Close up it hides the centre line and the road in
+        # front of it, so its lane cannot be read any more: on 11-19 (171.7 s, 211.4 s) it dropped out
+        # of "my lane" at y 380-450 and the car drove into it. The same box keeps it in my lane.
+        self.own_track = None
+        self.own_track_time = self.declare_parameter('own_track_time', 0.5).value
 
     def target_callback(self, msg):
         if msg.data in ('lane1', 'lane2') and msg.data != self.target_lane:
@@ -105,7 +110,13 @@ class Yolov8InfoExtractor(Node):
         ahead counts as ours."""
         own = other = False
         own_box = near_box = None
-        mine_lane = self.my_lane() or self.target_lane
+        # My lane is the planner's state (target_lane), corrected by the segmentation in the planner after
+        # 1 s of disagreement: a short wrong reading of the segmentation (212007 23.5 s, 128.5 s) flipped
+        # which cars counted as mine.
+        mine_lane = self.target_lane
+        now = time.monotonic()
+        track = self.own_track if self.own_track and now - self.own_track[1] <= self.own_track_time else None
+        own_lane = None
         for car in msg.detections:
             cx, cy = car.bbox.center.position.x, car.bbox.center.position.y
             w, h = car.bbox.size.x, car.bbox.size.y
@@ -117,9 +128,16 @@ class Yolov8InfoExtractor(Node):
                 continue
             side = car.id
             if side not in ('lane1', 'lane2'):
-                # Centre line says "on the line" or nothing: the lane mask under the car decides (on
-                # 11-19 a lane1 car at the image edge read "line" and the car turned into it).
-                side = lane_at(self.masks, box) or side
+                # Centre line says "on the line" or nothing: the lane mask under the car may only say
+                # it is in the OTHER lane (11-19: a lane1 car at the image edge read "line" and the car
+                # turned into it). It never makes a car mine: 11-20 lap 152618 24 s and 120 s, a lane1
+                # car at the left edge (x 1-140) read lane2 from the mask and the car turned into it.
+                mask_lane = lane_at(self.masks, box)
+                if mask_lane in ('lane1', 'lane2') and mask_lane != mine_lane:
+                    side = mask_lane
+                if side not in ('lane1', 'lane2') and track is not None and iou(box, track[0]) >= 0.3:
+                    side = track[2]       # the same car: it keeps the lane it was read in (after our
+                                          # lane change that is the other lane, not ours)
             if side in ('lane1', 'lane2'):
                 mine = side == mine_lane
             elif side == 'line':
@@ -138,9 +156,11 @@ class Yolov8InfoExtractor(Node):
             if mine:
                 own = True
                 if own_box is None or bottom > own_box[3]:
-                    own_box = box
+                    own_box, own_lane = box, mine_lane
             else:
                 other = True
+        if own_box is not None:
+            self.own_track = (own_box, now, own_lane)
         nan = float('nan')
         self.box_pub.publish(Float32MultiArray(data=[float(v) for v in (own_box or (nan,) * 4) + (near_box or (nan,) * 4)]))
         self.own_pub.publish(Bool(data=own))
@@ -148,6 +168,15 @@ class Yolov8InfoExtractor(Node):
         if (own, other) != self.last_report:
             self.get_logger().info(f'Car near: my lane ({mine_lane}) {own}, other lane {other}')
             self.last_report = (own, other)
+
+
+def iou(a, b):
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    if w <= 0 or h <= 0:
+        return 0.0
+    inter = w * h
+    return inter / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter)
 
 
 def lane_under_car(masks, x0=270, x1=370, y0=400, y1=445):

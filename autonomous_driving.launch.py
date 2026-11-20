@@ -30,7 +30,7 @@ def generate_launch_description():
         'estimated_speed': ('150', 'Speed when lane2 is estimated (uncertain); -1 = same as cruise_speed'),
         'hold_time': ('0.5', 'Seconds the last moving command is kept at speed 150 (shorter when faster)'),
         'avoid_speed': ('150', 'Lane change: speed cap while passing a car (manual demo run_04: 140-150)'),
-        'avoid_start_y': ('440', 'Lane change starts when the car ahead (box bottom) passes this image row (~1 m)'),
+        'avoid_start_y': ('315', 'Lane change starts while driving when the car ahead in my lane (box bottom) passes this image row (~1.8 m)'),
         'avoid_steer': ('7', 'Lane change: full lock out for a 15 step*s turn, then back; ends early when the segmentation shows the new lane'),
         'lost_hold_time': ('1.5', 'Lane lost: seconds driven on the recent road steering at 150 before stopping'),
         'reacquire_hold': ('0.5', 'Seconds at reduced speed after estimated lane tracking'),

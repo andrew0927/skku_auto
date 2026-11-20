@@ -20,6 +20,7 @@ def controller(monkeypatch):
     node.timer.cancel()
     node.lost_hold_time = 0.0  # the blind lane-lost drive has its own tests below
     node.red_confirm = 1  # one report is enough here; the confirmation has its own test
+    node.avoid_confirm = 1  # same for the car in my lane
     captured = []
     node.publisher = SimpleNamespace(publish=captured.append)
     node.mode_callback(String(data='autonomous_active'))
@@ -467,9 +468,9 @@ def test_each_obstacle_moves_the_car_to_the_other_lane_and_it_stays(controller):
     assert drive(node, frame, False, 3).left_speed == 255 and node.avoid_lane == 'lane2'
     moving = drive(node, frame, True, 1)
     assert node.avoid_lane == 'lane1' and lanes[-1] == 'lane1'
-    assert 0 < moving.left_speed <= 150 and node.state == 'lane change to lane1: out'
+    assert 0 < moving.left_speed <= 150 and node.state == 'lane change to lane1: out'  # turns while driving
     drive(node, frame, True, 10)   # the same car is still ahead while moving over: ignored
-    after = drive(node, frame, False, 110)
+    after = drive(node, frame, False, 200)
     assert node.avoid_lane == 'lane1' and after.left_speed == 255  # stays in lane1, full speed
     drive(node, frame, True, 1)    # next obstacle, now in lane1: back to lane2
     assert node.avoid_lane == 'lane2' and lanes[-1] == 'lane2'
@@ -506,12 +507,12 @@ def test_camera_car_in_my_lane_moves_over_and_other_lane_car_blocks(controller):
     node, _, _, frame = controller
     avoid_setup(node)
     frame()
-    cam(node, own=(260, 300, 400, 442))
+    cam(node, own=(260, 260, 400, 365))
     frame()
     assert node.avoid_lane == 'lane1'
     # Back in a fresh setup: a car in my lane and one in the other lane -> stop, no swerve.
     node.avoid_lane, node.switch_time, node.maneuver = 'lane2', None, None
-    cam(node, own=(260, 300, 400, 442), other=True)
+    cam(node, own=(260, 260, 400, 365), other=True)
     assert frame().left_speed == 0 and node.avoid_lane == 'lane2'
 
 
@@ -566,7 +567,7 @@ def test_car_in_my_lane_still_far_does_not_start_the_change(controller):
     node, _, _, frame = controller
     avoid_setup(node)
     frame()
-    cam(node, own=(260, 300, 380, 430))          # bottom 430: before avoid_start_y (440)
+    cam(node, own=(260, 260, 380, 300))          # bottom 300: before avoid_start_y (315, ~1.8 m)
     frame()
     assert node.avoid_lane == 'lane2' and node.maneuver is None
 
@@ -578,37 +579,70 @@ def run_frames(node, frame, n, own=None):
     return out
 
 
-def test_no_lane_change_at_the_traffic_light(controller):
+def test_no_lane_change_while_a_red_light_is_pending(controller):
     node, _, _, frame = controller
     avoid_setup(node)
     node.obey_lights = True
     frame()
-    node.crosswalk_ahead_callback(Bool(data=True))              # crosswalk in view
-    cam(node, own=(250, 300, 400, 442))
+    node.light_callback(String(data='red'))
+    cam(node, own=(250, 260, 400, 330))
     frame()
     assert node.avoid_lane == 'lane2' and node.maneuver is None
+
+
+def test_at_the_light_the_change_starts_once_the_car_is_confirmed_in_my_lane(controller):
+    # User 11-19: in front of the traffic light, turn as soon as the car is surely in my lane.
+    node, _, _, frame = controller
+    avoid_setup(node)
+    node.obey_lights = True
+    node.avoid_confirm = 3
+    node.light_callback(String(data='green'))
+    frame()
+    node.crosswalk_callback(Bool(data=True))                   # crosswalk just passed
+    for i in range(3):
+        node.light_callback(String(data='green'))
+        cam(node, own=(280, 230, 360, 285)); frame()          # far (y 285), but in my lane
+        assert (node.maneuver is None) == (i < 2)              # third report: confirmed
+    assert node.avoid_lane == 'lane1'
 
 
 def test_same_car_still_ahead_after_the_change_stops(controller):
     node, _, _, frame = controller
     avoid_setup(node)
     frame()
-    cam(node, own=(250, 300, 400, 442)); frame()
-    last = run_frames(node, frame, 130, own=(250, 300, 400, 442))  # never goes away
+    cam(node, own=(250, 260, 400, 365)); frame()
+    last = run_frames(node, frame, 130, own=(250, 260, 400, 365))  # never goes away
     assert last[-1].left_speed == 0 and node.state == 'obstacle in both lanes: stopped'
 
 
-def test_car_right_in_front_stops_even_right_after_a_lane_change(controller):
+def test_car_passing_close_on_its_side_does_not_stop(controller):
     node, _, _, frame = controller
     avoid_setup(node)
     frame()
-    cam(node, own=(250, 300, 400, 442)); frame()
-    run_frames(node, frame, 35)                      # lane change done, same car ignored for a while
-    cam(node, near=(8, 300, 336, 472))               # 11-18 21:27 66 s: the car fills our path
-    c = frame()
-    assert c.left_speed == 0 and node.state == 'car right in front: stopped'
     cam(node, near=(443, 300, 639, 467))             # run_04 107 s: passing it close on its left
-    assert frame().left_speed > 0
+    assert frame().left_speed > 0 and node.maneuver is None
+
+
+def test_car_in_my_lane_at_a_red_light_stops_without_reversing(controller):
+    node, _, _, frame = controller
+    avoid_setup(node)
+    node.obey_lights = True
+    frame()
+    cams = []
+    for _ in range(10):
+        node.light_callback(String(data='red'))
+        cam(node, own=(250, 260, 400, 365)); cams.append(frame())
+    assert all(c.left_speed == 0 for c in cams) and node.maneuver is None
+
+
+def test_a_reverse_is_never_held(controller):
+    node, _, _, frame = controller
+    avoid_setup(node)
+    frame()
+    cam(node, near=(122, 229, 336, 410)); frame()
+    for _ in range(5):
+        cam(node, near=(122, 229, 336, 410)); frame()
+    assert node.last_move is None or node.last_move.left_speed > 0
 
 
 def test_segmentation_lane_sets_the_direction_and_corrects_the_state(controller):
@@ -619,7 +653,7 @@ def test_segmentation_lane_sets_the_direction_and_corrects_the_state(controller)
         cam(node); frame()
     assert node.avoid_lane == 'lane2'                # state corrected
     node.lane_under_callback(String(data='lane2'))
-    cam(node, own=(250, 300, 400, 442))
+    cam(node, own=(250, 260, 400, 365))
     frame()
     assert node.avoid_lane == 'lane1' and node.maneuver['direction'] == -1   # from lane2: left
 
@@ -627,71 +661,84 @@ def test_segmentation_lane_sets_the_direction_and_corrects_the_state(controller)
 def start_change(node, frame, start):
     avoid_setup(node, start)
     frame()
+    node.road_history.clear()                       # straight road: the change is relative to 0
+    node.last_guided_time = None
     node.lane_under_callback(String(data=start))
-    cam(node, own=(250, 300, 400, 442))
+    cam(node, own=(250, 260, 400, 365))
     return frame()
 
 
-def test_change_is_full_lock_until_the_segmentation_shows_the_new_lane(controller):
+def heading(cmds):
+    """Heading (step*s) the commands give: forward adds the steering, reverse subtracts it."""
+    H = 0.0; trace = []
+    for c in cmds:
+        H += c.steering * 0.1 * (1 if c.left_speed > 0 else -1 if c.left_speed < 0 else 0); trace.append(H)
+    return H, trace
+
+
+def test_change_turns_out_while_driving_without_stopping(controller):
+    # User 11-19: turn from ~1.8 m right away (road stays in view); no stop, no reverse.
     node, _, _, frame = controller
     first = start_change(node, frame, 'lane2')
-    assert node.avoid_lane == 'lane1' and first.steering < 2      # ramping left
-    seen = []
-    for _ in range(8):                                             # still on lane2
-        node.lane_under_callback(String(data='lane2')); cam(node); seen.append(frame())
-    assert seen[-1].steering <= -4 and all(c.left_speed == 150 for c in seen)
-    node.lane_under_callback(String(data='lane1')); cam(node); c = frame()   # now on lane1
-    assert node.maneuver is None and not node.state.startswith('lane change')
-    assert node.avoid_lane == 'lane1'
+    assert node.avoid_lane == 'lane1' and first.left_speed > 0
+    cmds = [first]
+    for _ in range(10):
+        node.lane_under_callback(String(data='lane2')); cam(node); cmds.append(frame('lost'))
+    assert all(c.left_speed > 0 for c in cmds) and cmds[-1].steering <= -6
 
 
-def test_change_from_lane1_is_full_right(controller):
+def test_change_from_lane1_turns_the_wheels_right(controller):
     node, _, _, frame = controller
     start_change(node, frame, 'lane1')
-    for _ in range(8):
-        node.lane_under_callback(String(data='lane1')); cam(node); c = frame()
-    assert node.avoid_lane == 'lane2' and c.steering >= 4
+    cmds = []
+    for _ in range(10):
+        node.lane_under_callback(String(data='lane1')); cam(node); cmds.append(frame('lost'))
+    assert node.avoid_lane == 'lane2' and cmds[-1].left_speed > 0 and cmds[-1].steering >= 6
 
 
-def test_with_no_lane_visible_the_change_goes_out_and_comes_back_one_lane(controller):
+def test_change_ends_when_the_segmentation_shows_the_new_lane(controller):
     node, _, _, frame = controller
-    node.lane_steering = 0
-    first = start_change(node, frame, 'lane2')
-    seen = [first]
-    while node.maneuver is not None and len(seen) < 80:
-        cam(node); seen.append(frame('lost'))                   # no lane, no segmentation
-    steer = [c.steering for c in seen]
-    assert min(steer) <= -4 and max(steer) >= 4                 # out (left), then back (right)
-    assert steer.index(min(steer)) < steer.index(max(steer))
-    H = 0.0; peak = 0.0
-    for c in seen:
-        H += c.steering * 0.1; peak = min(peak, H)
-    assert -17 <= peak <= -13 and abs(H) <= 1.5                 # turned ~15 left, heading restored
+    start_change(node, frame, 'lane2')
+    node.lane_under_callback(String(data='lane1')); cam(node); frame('lost')
+    assert node.maneuver is not None                         # a reading before turning is a flicker
+    for _ in range(40):
+        node.lane_under_callback(String(data='lane2')); cam(node); frame('lost')
+        if node.maneuver['direction'] * node.maneuver['H'] >= 5:
+            break
+    node.lane_under_callback(String(data='lane1')); cam(node); frame()
     assert node.maneuver is None and node.avoid_lane == 'lane1'
 
 
-def test_segmentation_stuck_on_the_old_lane_still_turns_back(controller):
-    # Replays of 11-18: the segmentation kept showing the old lane, the change ran to its time limit
-    # and handed over with a 25-30 step*s turn. Now it turns at most 25 and always comes back.
+def test_with_no_lane_visible_the_change_comes_back_to_the_road_heading(controller):
     node, _, _, frame = controller
-    node.lane_steering = 0
     start_change(node, frame, 'lane2')
-    seen = []
-    while node.maneuver is not None and len(seen) < 200:
-        node.lane_under_callback(String(data='lane2')); cam(node); seen.append(frame('lost'))
-    H = 0.0; peak = 0.0
-    for c in seen:
-        H += c.steering * 0.1; peak = min(peak, H)
-    assert peak >= -27 and peak <= -20 and abs(H) <= 2.0
-    assert node.maneuver is None
+    cmds = []
+    while node.maneuver is not None and len(cmds) < 200:
+        cam(node); cmds.append(frame('lost'))                   # no lane, no segmentation, car gone
+    H, trace = heading(cmds)
+    assert min(trace) <= -13 and abs(H) <= 1.5                  # turned ~15 left, heading restored
+    assert any(c.left_speed > 0 and c.steering >= 4 for c in cmds)   # turned back right
+    assert node.maneuver is None and node.avoid_lane == 'lane1'
+
+
+def test_segmentation_stuck_on_the_old_lane_still_ends(controller):
+    node, _, _, frame = controller
+    start_change(node, frame, 'lane2')
+    cmds = []
+    while node.maneuver is not None and len(cmds) < 250:
+        node.lane_under_callback(String(data='lane2')); cam(node); cmds.append(frame('lost'))
+    H, trace = heading(cmds)
+    assert node.maneuver is None and min(trace) >= -27 and abs(H) <= 2.0
 
 
 def test_does_not_turn_back_while_the_car_is_still_beside_on_that_side(controller):
-    # 11-19 104-108 s: passing left, the computed turn was reached while the car was still at our
-    # front right (x 240-456); turning back then steered at it.
+    # 11-19 104-108 s: turning back while the car was still at our front right steered at it.
     node, _, _, frame = controller
-    node.lane_steering = 0
     start_change(node, frame, 'lane2')
+    for _ in range(40):
+        cam(node, near=(240, 300, 456, 375)); frame('lost')
+        if node.maneuver['phase'] not in ('stop', 'settle', 'reverse'):
+            break
     steer = []
     for _ in range(25):                                         # car still front-right
         cam(node, near=(240, 300, 456, 375)); steer.append(frame('lost').steering)
@@ -700,3 +747,144 @@ def test_does_not_turn_back_while_the_car_is_still_beside_on_that_side(controlle
         cam(node, near=(480, 300, 640, 440)); steer.append(frame('lost').steering)
     assert max(steer) > 0                                        # then turned back
 
+
+def test_on_a_curve_the_change_is_relative_to_the_curve(controller):
+    # 205159 80 s: on a left curve (-5) the change turned a full extra 15 and left the road.
+    node, _, _, frame = controller
+    avoid_setup(node, 'lane2')
+    for _ in range(12):
+        frame(left=True)                                        # lane following a left curve
+    base = node.road_steering()
+    assert base <= -3
+    node.lane_under_callback(String(data='lane2'))
+    cam(node, own=(250, 260, 400, 365)); frame(left=True)
+    assert node.maneuver['base'] == base
+    cmds = []
+    while node.maneuver is not None and len(cmds) < 200:
+        cam(node); cmds.append(frame('lost'))
+    rel = 0.0; low = 0.0
+    for c in cmds:
+        sgn = 1 if c.left_speed > 0 else -1 if c.left_speed < 0 else 0
+        rel += (c.steering - base) * 0.1 * sgn; low = min(low, rel)
+    # Relative to the curve the turn is limited by the lock (-7 on a -5 curve is only -2 more), but it
+    # never goes past 15 and the heading is restored to the curve.
+    assert -18 <= low <= -3 and abs(rel) <= 2.0
+
+
+
+def test_other_lane_car_on_a_curve_is_not_a_reason_to_stop_at_1m(controller):
+    # 11-19 lap 193158 247 s: in lane1, a lane2 car at x 323-576 y 365 overlapped our straight path.
+    node, _, _, frame = controller
+    avoid_setup(node, 'lane1')
+    frame()
+    cam(node, near=(323, 260, 576, 365), other=True)
+    assert frame().left_speed > 0 and node.maneuver is None
+
+
+def test_car_labelled_other_lane_but_straight_ahead_stops_until_sure(controller):
+    # 11-19 lap 210352 47.5 s: 'lane1' at x 326-507 y 368 while the segmentation put us on lane2: hit.
+    node, _, _, frame = controller
+    avoid_setup(node, 'lane2')
+    node.lane_under_callback(String(data='lane2'))
+    frame()
+    cam(node, near=(326, 260, 507, 368), other=True)
+    c = frame()
+    assert c.left_speed == 0 and node.maneuver is None and 'not sure' in node.state   # stop, no turn
+    node.lane_under_callback(String(data='lane2'))
+    cam(node, own=(326, 260, 507, 368)); c = frame()                 # now confirmed in my lane
+    assert node.maneuver is not None and node.maneuver['phase'] == 'stop' and node.avoid_lane == 'lane1'
+
+
+def test_other_lane_car_beside_our_path_close_is_waited_for(controller):
+    node, _, _, frame = controller
+    avoid_setup(node, 'lane1')
+    frame()
+    for _ in range(5):
+        cam(node, near=(330, 260, 560, 420), other=True); c = frame()   # centre x 445: not ahead
+    assert c.left_speed == 0 and node.maneuver is None
+    for _ in range(30):                                   # never sure it is in my lane: keeps waiting
+        cam(node, near=(330, 260, 560, 420), other=True); c = frame()
+    assert c.left_speed == 0 and node.maneuver is None
+
+
+def test_car_lost_by_the_detector_when_close_is_still_there(controller):
+    # 11-19 lap 210352 48.5-49 s: in our path at y 372, then gone from the detections; the car hit it.
+    node, _, _, frame = controller
+    avoid_setup(node)
+    frame()
+    cam(node, near=(328, 260, 508, 390), other=True); frame()
+    cam(node, near=(70, 230, 257, 313)); c = frame()            # the detector now sees only a far car
+    assert c.left_speed == 0
+
+
+def test_car_in_my_lane_at_1m_right_after_a_change_stops(controller):
+    # Right after a lane change no new change starts (same-car window): not turning at 1 m -> stop.
+    node, _, _, frame = controller
+    avoid_setup(node)
+    frame()
+    cam(node, own=(250, 260, 400, 365)); frame()
+    node.maneuver = None                                        # change over, window still running
+    cam(node, own=(250, 260, 400, 370))
+    c = frame()
+    assert c.left_speed == 0 and 'not turning' in node.state
+
+
+
+def test_change_needs_the_car_confirmed_in_my_lane(controller):
+    node, _, _, frame = controller
+    avoid_setup(node)
+    node.avoid_confirm = 3
+    frame()
+    for i in range(3):
+        cam(node, own=(250, 260, 400, 320)); frame()
+        assert (node.maneuver is None) == (i < 2)
+
+
+def test_no_early_change_before_the_crosswalk(controller):
+    # 212007 8 s: before the stop line, a car ~4 m beyond the light started a change.
+    node, _, _, frame = controller
+    avoid_setup(node)
+    node.obey_lights = True
+    frame()
+    for _ in range(5):
+        node.crosswalk_ahead_callback(Bool(data=True))
+        node.light_callback(String(data='none'))
+        cam(node, own=(280, 230, 360, 285)); frame()
+    assert node.maneuver is None
+
+
+def test_my_lane_is_the_state_not_one_segmentation_reading(controller):
+    # 212007 128.5 s: one lane2 reading while in lane1 started a change "to lane1".
+    node, _, _, frame = controller
+    avoid_setup(node, 'lane1')
+    frame()
+    node.lane_under_callback(String(data='lane2'))
+    cam(node, own=(250, 260, 400, 330)); frame()
+    assert node.maneuver is not None and node.avoid_lane == 'lane2'   # from lane1 to lane2
+
+
+def test_car_confirmed_in_my_lane_starts_the_change_wherever_it_is_in_the_image(controller):
+    # 11-19 lap 213025 9-14 s: left curve, my-lane car at x 1-227: a "must block x 220-420" rule kept the
+    # change from starting and the car drove into it.
+    node, _, _, frame = controller
+    avoid_setup(node)
+    frame()
+    cam(node, own=(11, 230, 227, 320)); frame()
+    assert node.maneuver is not None and node.avoid_lane == 'lane1'
+
+
+def test_too_close_only_stops_never_reverses(controller):
+    # User 11-20: the code never reverses; the operator backs off by hand when needed.
+    node, _, _, frame = controller
+    avoid_setup(node)
+    node.lane_under_callback(String(data='lane2'))
+    frame()
+    cmds = []
+    for _ in range(30):
+        cam(node, own=(220, 300, 420, 420)); cmds.append(frame('lost'))
+    assert all(c.left_speed >= 0 for c in cmds) and cmds[-1].left_speed == 0
+    cam(node, own=(250, 260, 400, 365)); frame()               # change under way, then too close
+    for _ in range(5):
+        cam(node, near=(200, 300, 420, 420)); c = frame('lost')
+        assert c.left_speed >= 0
+    assert c.left_speed == 0

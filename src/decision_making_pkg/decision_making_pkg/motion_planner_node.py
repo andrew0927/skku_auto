@@ -105,11 +105,33 @@ class MotionPlanningNode(Node):
         # * Whenever the segmentation shows the car on the new lane, lane following of that lane
         #   takes over at once (the human eased off right then in run_04).
         self.avoid_speed = self.declare_parameter('avoid_speed', 150).value
-        # Box bottom row where the change starts. Ground distance ~ 1 / (row - horizon), horizon
-        # ~ y 169 (where the calibration's lane lines meet): y 310 was ~2 m (user, 11-19), so ~1 m
-        # is y 440-450. The user asked for ~1 m.
-        self.avoid_start_y = self.declare_parameter('avoid_start_y', 440.0).value
-        self.front_stop_y = self.declare_parameter('front_stop_y', 455.0).value
+        # Image row of the car ahead (box bottom) vs the gap between the two cars: gap ~ k/(y-169) - c
+        # with the horizon at y 169. Gap 0 at y ~465 (our hood edge; the 11-19 hits ended at box
+        # bottom 468-474) and 2 m at y 310 (user, 11-19) give k 538, c 1.82: 1 m at y ~360, 0.5 m at
+        # y ~400. (y 440 was taken as 1 m from the camera, not between the cars: the car hit at once.)
+        # The change starts while driving at ~1.8 m (y 315): where the reverse of 11-19 lap 210352 ended
+        # (box bottom 309-316) - the user: turn from there or further back, so the road stays in view.
+        self.avoid_start_y = self.declare_parameter('avoid_start_y', 315.0).value
+        # A car in my lane (or straight ahead whatever its label) at ~1.8 m without a change under way stops
+        # the car (braking takes ~0.3 s / 10-15 px). 212007 26 s: the user stopped it at y 339 (~1.4 m) as
+        # too close; 210352: at y 374.
+        self.avoid_stop_y = self.declare_parameter('avoid_stop_y', 315.0).value
+        # A change starts only for a car confirmed in my lane: avoid_confirm consecutive reports (user,
+        # 11-19: move only when sure). Around the traffic light it starts as soon as it is confirmed,
+        # whatever the distance; elsewhere from avoid_start_y.
+        self.avoid_confirm = self.declare_parameter('avoid_confirm', 3).value
+        self.avoid_arrive_turn = self.declare_parameter('avoid_arrive_turn', 5.0).value
+        self.own_streak = 0
+        self.light_zone_time = self.declare_parameter('light_zone_time', 5.0).value
+        # Any car in our path (box overlapping x 220-420 by 60 px) at front_stop_y (~0.5 m) stops the car.
+        # The code never reverses (user, 11-20): the operator watching the drive backs off by hand.
+        self.front_stop_y = self.declare_parameter('front_stop_y', 400.0).value
+        # Standing still while the wheels turn to the out lock before a change from a stop.
+        self.avoid_settle = self.declare_parameter('avoid_settle', 0.3).value
+        self.wait_since = None
+        self.held_box = None
+        self.held_box_y = self.declare_parameter('held_box_y', 380.0).value
+        self.held_box_time = self.declare_parameter('held_box_time', 3.0).value
         self.avoid_steer = self.declare_parameter('avoid_steer', 7).value
         self.avoid_steer_rate = self.declare_parameter('avoid_steer_rate', 6.5).value
         self.avoid_heading = self.declare_parameter('avoid_heading', 15.0).value
@@ -119,7 +141,7 @@ class MotionPlanningNode(Node):
         self.avoid_out_max = self.declare_parameter('avoid_out_max', 4.0).value
         self.avoid_total_max = self.declare_parameter('avoid_total_max', 12.0).value
         self.avoid_release_x = self.declare_parameter('avoid_release_x', 470).value
-        self.avoid_hold_max = self.declare_parameter('avoid_hold_max', 2.0).value
+        self.avoid_hold_max = self.declare_parameter('avoid_hold_max', 5.0).value
         self.maneuver = None
         self.approaching = False
         self.own_box = self.near_box = None   # (x0, y0, x1, y1) from the lane extractor
@@ -282,6 +304,7 @@ class MotionPlanningNode(Node):
 
     def camera_callback(self, msg):
         self.camera_obstacle, self.camera_time = bool(msg.data), time.monotonic()
+        self.own_streak = self.own_streak + 1 if msg.data else 0
 
     def camera_other_callback(self, msg):
         self.camera_other = bool(msg.data)
@@ -312,9 +335,24 @@ class MotionPlanningNode(Node):
         if len(values) != 8:
             return
         own, near = values[:4], values[4:]
+        now = time.monotonic()
         self.own_box = tuple(own) if all(math.isfinite(v) for v in own) else None
-        self.near_box = tuple(near) if all(math.isfinite(v) for v in near) else None
-        self.box_time = time.monotonic()
+        near = tuple(near) if all(math.isfinite(v) for v in near) else None
+        # A car close in our path that the detector stops seeing is still there: at ~0.5 m it lost the car
+        # (11-19 210352 49 s) and the car drove into it. Keep its last box while nothing covers that spot,
+        # until we back off (reversing brings it back into view) or held_box_time passes.
+        held = self.held_box
+        if near is not None and near[3] >= self.held_box_y and self.in_path(now, near):
+            self.held_box = (near, now)
+        elif held is not None:
+            covered = near is not None and min(near[2], held[0][2]) - max(near[0], held[0][0]) > 0 \
+                and near[3] >= held[0][1]
+            if covered or now - held[1] > self.held_box_time:
+                self.held_box = None
+            else:
+                near = held[0]
+        self.near_box = near
+        self.box_time = now
 
     def offset_callback(self, msg):
         self.obstacle_offset = float(msg.data)
@@ -351,37 +389,70 @@ class MotionPlanningNode(Node):
                 return 'blocked'      # a one-frame miss does not restart the car
         if self.switching(now):
             return None
-        if obstacle and (self.crosswalk_ahead(now) or self.red_recent(now)
-                         or (self.cross_until is not None and now <= self.cross_until)):
-            return None  # at the traffic light: cars wait there, and turning hides the light
+        if obstacle and not self.avoid_allowed(now):
+            return None  # red light: cars wait there
         if obstacle and not self.moving and (self.state or '').startswith(('lane lost timeout', 'stopped at')):
             return None  # stopped (lane lost, red light): a car seen now does not start a lane change
         own_box = self.own_box if camera_ok and self.box_time is not None and now - self.box_time <= self.source_timeout else None
         self.approaching = bool(camera_ok and self.camera_obstacle and own_box is not None)
         if camera_ok and self.camera_obstacle and not (lidar_ok and self.obstacle):
-            if own_box is None or own_box[3] < self.avoid_start_y:
-                return None   # in my lane but still far: slow down (approaching), not yet OUT
+            # Only a car surely in my lane moves us (user, 11-19): avoid_confirm reports in a row.
+            confirmed = self.own_streak >= self.avoid_confirm
+            if own_box is None or not confirmed or (own_box[3] < self.avoid_start_y and not self.light_zone(now)):
+                return None   # in my lane but still far or not yet sure: slow down (approaching), not yet OUT
         if obstacle:
             if self.switch_time is not None and not self.cleared_since_switch:
                 self.blocked = True
                 return 'blocked'  # still the same obstacle after moving over: both lanes blocked
-            current = self.seen_lane(now) or self.avoid_lane   # where the car really is
+            # My lane is the state (the user: we know which lane we are in; the segmentation corrects it
+            # through sync_lane after 1 s). 212007 128.5 s: one lane2 reading started a "change" to the
+            # lane we were already on.
+            current = self.avoid_lane
             other = 'lane1' if current == 'lane2' else 'lane2'
             # lane1 is the left lane: do not steer towards the side the obstacle sits on.
             towards = self.obstacle_offset if other == 'lane1' else -self.obstacle_offset
             if other_blocked or (lidar_ok and math.isfinite(towards) and towards > self.side_margin):
                 return 'blocked'
-            self.set_avoid_lane(other, 'obstacle ahead')
-            self.switch_time, self.cleared_since_switch = now, False
-            direction = -1 if other == 'lane1' else 1
-            self.maneuver = {'start': now, 'direction': direction, 'target': other, 'from': current, 'phase': 'out',
-                             'base': 0.0, 'steer': float(self.lane_steering), 'H': 0.0, 'Y': 0.0}
-            self.get_logger().info(
-                f"Lane change {current} -> {other} ({'left' if direction < 0 else 'right'}): "
-                f"{direction * self.avoid_steer:+d} then {-direction * self.avoid_steer:+d} for "
-                f"a {self.avoid_heading:.0f} step*s turn each way, or until the segmentation shows {other}"
-                + (f', car box bottom y {own_box[3]:.0f}' if own_box else ''))
+            # Turn out while driving, from ~1.8 m (or at once at the light): the road stays in view.
+            # Starting at 1 m (205159 186 s) hit the car with the front corner. Reverse only when too
+            # close; a car that got to 1.8 m without a change, or to 0.5 m, stops the car (timer).
+            # Standing (stopped for it before it was confirmed): set the wheels first, then out.
+            self.start_maneuver(now, current, 'out' if self.moving else 'stop', 'obstacle ahead'
+                                + (f', car box bottom y {own_box[3]:.0f}' if own_box else ''))
         return None
+
+    def avoid_allowed(self, now):
+        """A lane change may start: not while a red light is pending or we stand at it (cars wait there)."""
+        return not (self.red_recent(now) or self.stopped_for_red)
+
+    def light_zone(self, now):
+        """Just past the traffic light: crossing it (green) or the crosswalk passed within light_zone_time.
+        Not before it: 11-19 lap 212007 8 s changed lanes before the stop line for a car ~4 m beyond."""
+        if self.stopped_for_red or self.red_recent(now) or self.crosswalk_ahead(now):
+            return False
+        crossing = self.cross_until is not None and now <= self.cross_until
+        passed = self.last_crosswalk_near_time is not None and now - self.last_crosswalk_near_time <= self.light_zone_time
+        return crossing or passed
+
+    def start_maneuver(self, now, current, phase, reason):
+        """Lane change from current to the other lane; phase 'out' turns at once, 'stop' sets the wheels first."""
+        other = 'lane1' if current == 'lane2' else 'lane2'
+        self.set_avoid_lane(other, reason)
+        self.switch_time, self.cleared_since_switch = now, False
+        direction = -1 if other == 'lane1' else 1
+        # The road's own curve: the lane-following steering of the last second. The change is computed
+        # relative to it (heading and sideways offset relative to the road), so on a curve the car keeps
+        # following the curve while it moves over. 11-19 lap 205159 80 s and 186 s: on a left curve
+        # (steering -5) the change added its full turn to the curve and drove off the road.
+        recent = self.last_guided_time is not None and now - self.last_guided_time <= self.road_window
+        base = float(self.road_steering()) if recent else 0.0
+        self.maneuver = {'start': now, 'direction': direction, 'target': other, 'from': current, 'phase': phase,
+                         'base': base, 'steer': float(self.lane_steering), 'H': 0.0, 'Y': 0.0,
+                         'phase_start': now}
+        self.get_logger().info(
+            f"Lane change {current} -> {other} ({'left' if direction < 0 else 'right'}, {phase}): "
+            f"{direction * self.avoid_steer:+d} then {-direction * self.avoid_steer:+d} for "
+            f"a {self.avoid_heading:.0f} step*s turn each way, or until the segmentation shows {other}; {reason}")
 
     def switching(self, now):
         scale = min(1.0, self.hold_reference_speed / max(self.red_approach_speed, 1))
@@ -410,7 +481,15 @@ class MotionPlanningNode(Node):
         scale = speed / float(self.hold_reference_speed)        # time -> distance (150-seconds)
         rate = self.avoid_steer_rate / max(scale, 1e-3)          # ramp per distance unit
         d, base, peak = m['direction'], m['base'], self.avoid_steer
-        arrived = self.seen_lane(now) == m['target']
+        if m['phase'] == 'stop':
+            # Standing still while the wheels go to the out lock (the servo is slow), then OUT.
+            m['steer'] = float(clamp(base + d * peak, -peak, peak))
+            if now - m['phase_start'] >= self.avoid_settle:
+                m['phase'], m['start'] = 'out', now
+            return int(round(m['steer'])), 0, 'stop'
+        # Arrived only after some turn: a lane reading of the target before moving over was a flicker
+        # (212007 128.5-129.5 s ended a change at once).
+        arrived = self.seen_lane(now) == m['target'] and d * m['H'] >= self.avoid_arrive_turn
         rel = m['steer'] - base
         # The turn keeps growing while the steering ramps back through zero: count it in.
         turn = d * m['H'] + max(d * rel, 0.0) ** 2 / (2 * rate)
@@ -425,7 +504,10 @@ class MotionPlanningNode(Node):
         if m['phase'] in ('out', 'hold') and clear and ((turn >= self.avoid_heading and not still_old)
                                                         or turn >= self.avoid_heading_max or out_long):
             m['phase'] = 'back'
-        elif m['phase'] == 'out' and (turn >= self.avoid_heading_max or out_long):
+        elif m['phase'] == 'out' and (turn >= self.avoid_heading_max or out_long
+                                      or (m.get('backed') and turn >= self.avoid_heading)):
+            # After backing off the nose already points the computed turn: no more turning, drive on
+            # until the car is beside us (205159 83 s: turning on to 25 left the road).
             m['phase'], m['hold_start'] = 'hold', now   # turned enough: keep the heading until beside
         elif m['phase'] == 'hold' and now - m['hold_start'] > self.avoid_hold_max / max(scale, 1e-3):
             self.get_logger().warning('Lane change: the car never got beside us, stopping')
@@ -444,7 +526,8 @@ class MotionPlanningNode(Node):
             self.maneuver = None
             self.switch_time = now       # the same car is still ignored for avoid_switch_time
             return None
-        target = {'out': d * peak, 'hold': base, 'back': -d * peak, 'unwind': base}[m['phase']]
+        target = clamp({'out': base + d * peak, 'hold': base, 'back': base - d * peak, 'unwind': base}[m['phase']],
+                       -peak, peak)
         step = self.avoid_steer_rate * dt
         m['steer'] = clamp(target, m['steer'] - step, m['steer'] + step)
         m['H'] += (m['steer'] - base) * dt * scale
@@ -461,14 +544,27 @@ class MotionPlanningNode(Node):
         m['last_seen'] = now
         return box[0] >= self.avoid_release_x if m['direction'] < 0 else box[2] <= 640 - self.avoid_release_x
 
-    def car_right_in_front(self, now):
-        """The nearest car's box reaches the bottom of the image (y >= front_stop_y, ~0.95 m) across our path
-        (overlaps x 220-420 by 60 px). The manual passes of run_04 kept it outside (left edge >= 399
-        when that close); the 11-18 collisions covered x 8-336 at y 449-472."""
+    def in_path(self, now, box, need=60):
+        """The box overlaps our path straight ahead (x 220-420) by need px."""
+        return min(box[2], 420) - max(box[0], 220) >= need
+
+    def car_ahead(self, now, row=None):
+        """The nearest car straight ahead at the stop row: box bottom >= avoid_stop_y and its centre within
+        our path x 220-420 (other-lane cars on curves had their centre at x 433-450), else None."""
         box = self.near_box if self.box_time is not None and now - self.box_time <= self.source_timeout else None
-        if box is None or box[3] < self.front_stop_y:
+        row = self.avoid_stop_y if row is None else row
+        if box is None or box[3] < row or not 220 <= (box[0] + box[2]) / 2 <= 420:
+            return None
+        return box
+
+    def car_in_path(self, now, row):
+        """The nearest car's box bottom is at or below row and it overlaps our path (x 220-420) by 60 px.
+        The manual passes of run_04 kept it outside (left edge >= 399 when close); the 11-18/19 hits
+        covered x 8-336 and 117-412."""
+        box = self.near_box if self.box_time is not None and now - self.box_time <= self.source_timeout else None
+        if box is None or box[3] < row:
             return False
-        return min(box[2], 420) - max(box[0], 220) >= 60
+        return self.in_path(now, box)
 
     def change_speed(self):
         return int(min(self.driving_speed, self.avoid_speed))
@@ -661,12 +757,40 @@ class MotionPlanningNode(Node):
                     self.lane_steering = command.steering
                     if self.maneuver is None:
                         self.guided(now, command.steering)
+        stop_reason = None
+        if self.auto_active and self.avoid_obstacles and not blocked:
+            # Never drive into a car (11-19: 4 hits). A car confirmed in my lane starts a lane change
+            # (avoidance); one at ~1.2 m without a change under way, or straight ahead with its lane not
+            # sure, stops the car. Any car in our path at ~0.5 m stops it. We move only when sure (user,
+            # 11-19) and never reverse (user, 11-20).
+            m = self.maneuver
+            own_box = self.own_box if self.camera_obstacle and self.box_time is not None \
+                and now - self.box_time <= self.source_timeout else None
+            own_close = own_box is not None and own_box[3] >= self.avoid_stop_y and self.in_path(now, own_box)
+            ahead = self.car_ahead(now)
+            if m is None and ahead is not None and not own_close:
+                # Straight ahead at ~1.2 m but labelled the other lane or unknown (210352 47.5 s: 'lane1' at
+                # x 326-507 while the segmentation put us on lane2; we hit it). Not sure it is in my lane,
+                # so no lane change: stop and wait (it starts once the car is confirmed in my lane).
+                stop_reason = f'car straight ahead at y {ahead[3]:.0f}, lane not sure: stopped'
+            if not self.car_in_path(now, self.front_stop_y):
+                self.wait_since = None
+            if stop_reason is not None:
+                pass
+            elif m is None and own_close:
+                # avoidance() ran just before: it did not start a change (traffic light, right after a
+                # change, ...), so the car is not turning away at 1 m: stop.
+                stop_reason = f'car in my lane at y {own_box[3]:.0f}, not turning: stopped'
+            elif self.car_in_path(now, self.front_stop_y):
+                where = f'car in our path at y {self.near_box[3]:.0f}'
+                # Too close: stop. The code never reverses (user, 11-20): the operator watching the drive
+                # backs off by hand when needed. A change under way is dropped.
+                stop_reason = f'{where}: stopped'
+                self.maneuver = None
         profile = self.maneuver_command(now, dt) if self.auto_active else None
-        if self.car_right_in_front(now) and self.auto_active and self.avoid_obstacles:
-            # Whatever the state machine thinks: a car this close straight ahead means stop.
-            state = 'car right in front: stopped'
+        if stop_reason is not None:
+            state = stop_reason
             command = MotionCommand(steering=command.steering)
-            self.maneuver = None
             profile = None
         elif blocked and self.auto_active:
             state = 'obstacle in both lanes: stopped'
@@ -692,7 +816,7 @@ class MotionPlanningNode(Node):
             # Only commands that actually drove the car may be held (not ones computed while
             # waiting or in manual mode).
             # The blind lane-lost drive is itself the hold: it is not held again when it ends.
-            if self.auto_active and not blind:
+            if self.auto_active and not blind and command.left_speed > 0:  # never hold a reverse
                 # The hold is timed from the last command based on a new frame, so driving on
                 # an old path (up to path_timeout) does not lengthen it.
                 if self.path_count != self.last_move_path or self.last_move is None:
